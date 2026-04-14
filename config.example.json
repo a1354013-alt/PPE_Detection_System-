@@ -1,0 +1,8 @@
+{
+  "confidence_threshold": 0.4,
+  "violation_threshold": 3,
+  "helmet_class_id": 0,
+  "person_class_id": 0,
+  "model_path": "yolov8n.pt",
+  "iou_threshold": 0.45
+}

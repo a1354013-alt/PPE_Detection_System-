@@ -4,11 +4,11 @@ from ultralytics import YOLO
 from collections import deque
 
 class HelmetDetector:
-    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45):
+    def __init__(self, model_path='yolov8n.pt', confidence_threshold=0.4, iou_threshold=0.45):
         self.model = None
         self.model_path = model_path
-        self.conf = conf
-        self.iou = iou
+        self.confidence_threshold = confidence_threshold
+        self.iou_threshold = iou_threshold
         self.load_model(model_path)
         
         # 類別映射表：將模型標籤映射到系統邏輯標籤
@@ -71,7 +71,7 @@ class HelmetDetector:
         if self.model is None:
             return frame, {'error': '模型未載入'}
 
-        results = self.model(frame, conf=self.conf, iou=self.iou, verbose=False)
+        results = self.model(frame, conf=self.confidence_threshold, iou=self.iou_threshold, verbose=False)
         result = results[0]
         names = result.names
         

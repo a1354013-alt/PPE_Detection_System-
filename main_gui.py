@@ -5,11 +5,39 @@ from PIL import Image, ImageTk
 import threading
 import time
 import os
+import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from helmet_detector import HelmetDetector
 import queue
+
+
+def load_config(path="config.json"):
+    """
+    載入 config.json 設定檔
+    
+    Args:
+        path: config 檔案路徑，預設為 "config.json"
+    
+    Returns:
+        dict: 設定字典，若檔案不存在或格式錯誤則回傳空字典
+    """
+    default_config = {}
+    
+    if not os.path.exists(path):
+        return default_config
+    
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            if isinstance(config, dict):
+                return config
+            else:
+                return default_config
+    except (json.JSONDecodeError, IOError, Exception):
+        return default_config
+
 
 class HelmetDetectionApp:
     def __init__(self, window, window_title):
@@ -18,8 +46,23 @@ class HelmetDetectionApp:
         self.window.geometry("1300x900")
         self.window.configure(bg="#1e1e1e")
 
-        # 初始化偵測器
-        self.detector = HelmetDetector()
+        # 載入 config.json 設定
+        self.config = load_config("config.json")
+        
+        # 從 config 取得參數，若無則使用預設值
+        self.confidence_threshold = self.config.get("confidence_threshold", 0.4)
+        self.violation_threshold = self.config.get("violation_threshold", 3)
+        self.helmet_class_id = self.config.get("helmet_class_id", 0)
+        self.person_class_id = self.config.get("person_class_id", 0)
+        self.model_path = self.config.get("model_path", "yolov8n.pt")
+        self.iou_threshold = self.config.get("iou_threshold", 0.45)
+
+        # 初始化偵測器，傳入 config 中的參數
+        self.detector = HelmetDetector(
+            model_path=self.model_path,
+            confidence_threshold=self.confidence_threshold,
+            iou_threshold=self.iou_threshold
+        )
         self.running = False
         self.vid = None
         

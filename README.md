@@ -8,6 +8,21 @@
 pip install ultralytics opencv-python pillow matplotlib
 ```
 
+## ⚙️ 設定檔配置 (Configuration)
+系統支援透過 `config.json` 自訂參數：
+
+1. **建立設定檔**：將 `config.example.json` 複製為 `config.json`
+   ```bash
+   cp config.example.json config.json
+   ```
+
+2. **可配置參數**：
+   - `confidence_threshold`: YOLO 偵測信心閾值 (預設 0.4)
+   - `iou_threshold`: IOU 非極大值抑制閾值 (預設 0.45)
+   - `model_path`: 預設模型路徑 (預設 "yolov8n.pt")
+
+3. **若無 config.json**：系統會自動使用內建預設值啟動
+
 ## 📂 模型權重配置 (Model Configuration)
 1. **預設模型**：系統啟動時會自動下載 `yolov8n.pt` (COCO 資料集)。
 2. **自定義模型**：建議使用針對 PPE 訓練的模型（如 `ppe.pt`）。
