@@ -5,11 +5,18 @@ from PIL import Image, ImageTk
 import threading
 import time
 import os
+import json
+import logging
 from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from helmet_detector import HelmetDetector
+from helmet_detector import HelmetDetector, MAX_LOG_SIZE
 import queue
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 class HelmetDetectionApp:
     def __init__(self, window, window_title):
@@ -22,6 +29,7 @@ class HelmetDetectionApp:
         self.detector = HelmetDetector()
         self.running = False
         self.vid = None
+        self.cap = None
         
         # 執行緒安全隊列
         self.result_queue = queue.Queue()
@@ -31,9 +39,40 @@ class HelmetDetectionApp:
                       "missing_counts": {"helmet": 0, "vest": 0, "goggles": 0, "mask": 0}}
         
         if not os.path.exists("violations"): os.makedirs("violations")
+        
+        # Load config safely
+        self.config = self.load_config("config.json")
 
         self.setup_ui()
         self.check_queue() # 開始輪詢隊列
+        
+        # Register cleanup on window close
+        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def load_config(self, config_path):
+        default_config = {
+            "confidence_threshold": 0.5,
+            "helmet_class_id": 0,
+            "person_class_id": 1,
+            "violation_threshold": 5
+        }
+        
+        try:
+            if not os.path.exists(config_path):
+                logging.warning("Config not found. Using default.")
+                return default_config
+            
+            with open(config_path, "r") as f:
+                user_config = json.load(f)
+            
+            merged = {**default_config, **user_config}
+            logging.info("Config loaded")
+            return merged
+            
+        except Exception as e:
+            logging.error(f"Config load failed: {e}")
+            logging.warning("Using default config")
+            return default_config
 
     def setup_ui(self):
         # --- 頂部標題 ---
@@ -57,7 +96,7 @@ class HelmetDetectionApp:
         # 1. 模型管理
         self.model_frame = ttk.LabelFrame(self.right_frame, text="模型管理")
         self.model_frame.pack(fill=tk.X, pady=5)
-        self.lbl_model = tk.Label(self.model_frame, text=f"當前模型: {os.path.basename(self.detector.model_path)}", 
+        self.lbl_model = tk.Label(self.model_frame, text=f"當前模型：{os.path.basename(self.detector.model_path)}", 
                                   bg="#1e1e1e", fg="white", font=("Arial", 9))
         self.lbl_model.pack(pady=2, anchor=tk.W)
         tk.Button(self.model_frame, text="更換模型 (.pt)", command=self.change_model, bg="#393e46", fg="white").pack(fill=tk.X)
@@ -73,7 +112,7 @@ class HelmetDetectionApp:
         # 3. 統計數值
         self.stats_frame = ttk.LabelFrame(self.right_frame, text="即時統計")
         self.stats_frame.pack(fill=tk.X, pady=10)
-        self.lbl_total_v = tk.Label(self.stats_frame, text="累計違規: 0", font=("Arial", 14, "bold"), bg="#1e1e1e", fg="#ff4b2b")
+        self.lbl_total_v = tk.Label(self.stats_frame, text="累計違規：0", font=("Arial", 14, "bold"), bg="#1e1e1e", fg="#ff4b2b")
         self.lbl_total_v.pack(pady=5)
 
         # --- 底部控制區 ---
@@ -107,7 +146,7 @@ class HelmetDetectionApp:
         if path:
             success, msg = self.detector.load_model(path)
             if success:
-                self.lbl_model.config(text=f"當前模型: {os.path.basename(path)}")
+                self.lbl_model.config(text=f"當前模型：{os.path.basename(path)}")
                 self.validate_model_support()
                 messagebox.showinfo("成功", msg)
             else:
@@ -162,7 +201,7 @@ class HelmetDetectionApp:
         for m in info['missing_items']:
             if m in self.stats['missing_counts']:
                 self.stats['missing_counts'][m] += 1
-        self.lbl_total_v.config(text=f"累計違規: {self.stats['total_violations']}")
+        self.lbl_total_v.config(text=f"累計違規：{self.stats['total_violations']}")
         self.update_chart()
 
     def open_file(self):
@@ -173,10 +212,17 @@ class HelmetDetectionApp:
 
     def start_detection(self, source):
         if self.running: return
-        self.vid = cv2.VideoCapture(source)
-        if not self.vid.isOpened():
+        
+        # Check if model is loaded before starting detection
+        if self.detector.model is None:
+            messagebox.showerror("錯誤", "Detection cannot start because model failed to load.")
+            return
+        
+        self.cap = cv2.VideoCapture(source)
+        if not self.cap.isOpened():
             messagebox.showerror("錯誤", "無法開啟影像來源")
             return
+        self.vid = self.cap
         self.running = True
         self.btn_upload.config(state=tk.DISABLED)
         self.btn_camera.config(state=tk.DISABLED)
@@ -184,13 +230,40 @@ class HelmetDetectionApp:
 
     def worker_thread(self):
         last_cap_time = 0
+        fps_prev_time = time.time()
+        fps_value = 0.0
+        
         while self.running:
             ret, frame = self.vid.read()
-            if not ret: break
+            
+            # Detection loop safety check
+            if frame is None:
+                logging.warning("Empty frame detected")
+                continue
+            
+            if not ret:
+                break
+            
+            # Calculate FPS
+            curr_time = time.time()
+            fps_value = 1.0 / (curr_time - fps_prev_time) if (curr_time - fps_prev_time) > 0 else 0.0
+            fps_prev_time = curr_time
             
             display_frame = cv2.resize(frame, (800, 500))
             targets = [k for k, v in self.check_vars.items() if v.get()]
             annotated, info = self.detector.detect(display_frame, targets)
+            
+            # Add FPS display
+            fps_text = f"FPS: {fps_value:.2f}"
+            cv2.putText(
+                annotated,
+                fps_text,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2
+            )
             
             # 發送影像到 UI
             self.result_queue.put(("FRAME", annotated))
@@ -198,7 +271,9 @@ class HelmetDetectionApp:
             # 處理違規邏輯
             if info.get('violation_detected'):
                 curr_time = time.time()
-                if curr_time - last_cap_time > 3: # 3秒冷卻
+                if curr_time - last_cap_time > 3: # 3 秒冷卻
+                    # Add violation with memory protection
+                    self.detector.add_violation(info)
                     self.result_queue.put(("STATS", info))
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     cv2.imwrite(f"violations/v_{timestamp}.jpg", annotated)
@@ -209,9 +284,17 @@ class HelmetDetectionApp:
 
     def handle_stop(self):
         self.running = False
-        if self.vid: self.vid.release()
+        if self.vid:
+            self.vid.release()
+        self.cleanup()
         self.btn_upload.config(state=tk.NORMAL)
         self.btn_camera.config(state=tk.NORMAL)
+
+    def cleanup(self):
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        logging.info("Camera released")
 
     def stop_and_report(self):
         self.running = False
@@ -225,6 +308,7 @@ class HelmetDetectionApp:
 
     def on_closing(self):
         self.running = False
+        self.cleanup()
         self.window.destroy()
 
 if __name__ == "__main__":

@@ -2,6 +2,15 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from collections import deque
+import logging
+import os
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+MAX_LOG_SIZE = 500
 
 class HelmetDetector:
     def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45):
@@ -30,13 +39,22 @@ class HelmetDetector:
         # 穩定性過濾：記錄每個人的缺失狀態 (Person ID -> Deque of missing items)
         # 註：由於 YOLOv8 預設不帶 Tracking，這裡簡化為「全域連續幀判定」
         self.violation_buffer = deque(maxlen=5) # 記錄最近 5 幀的違規狀態
+        
+        # Violation log with memory protection
+        self.violation_log = []
 
     def load_model(self, path):
         try:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Model file not found: {path}")
+            
             self.model = YOLO(path)
-            return True, f"成功載入模型: {path}"
+            logging.info("Model loaded successfully")
+            return True, f"成功載入模型：{path}"
         except Exception as e:
-            return False, f"模型載入失敗: {str(e)}"
+            logging.error(f"Model load failed: {e}")
+            self.model = None
+            return False, f"模型載入失敗：{str(e)}"
 
     def get_model_classes(self):
         if not self.model: return []
@@ -128,6 +146,12 @@ class HelmetDetector:
             'violation_detected': is_stable_violation,
             'missing_items': unique_missing if is_stable_violation else []
         }
+
+    def add_violation(self, record):
+        """Add violation record with memory protection"""
+        self.violation_log.append(record)
+        if len(self.violation_log) > MAX_LOG_SIZE:
+            self.violation_log.pop(0)
 
     def generate_heatmap(self, shape):
         heatmap = np.zeros(shape[:2], dtype=np.float32)
