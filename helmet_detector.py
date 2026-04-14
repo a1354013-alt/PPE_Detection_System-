@@ -1,15 +1,43 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 from collections import deque
 
+# YOLO 延遲匯入，避免測試時硬依賴 ultralytics
+_YOLO = None
+
+def _get_yolo():
+    """Lazy import for YOLO to avoid hard dependency during testing."""
+    global _YOLO
+    if _YOLO is None:
+        try:
+            from ultralytics import YOLO
+            _YOLO = YOLO
+        except ImportError:
+            raise ImportError(
+                "ultralytics is required for model inference. "
+                "Install with: pip install ultralytics"
+            )
+    return _YOLO
+
+
 class HelmetDetector:
-    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45):
+    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45,
+                 confidence_threshold=0.4, violation_threshold=3,
+                 helmet_class_id=None, person_class_id=0):
         self.model = None
         self.model_path = model_path
-        self.conf = conf
-        self.iou = iou
-        self.load_model(model_path)
+        self.conf = conf  # YOLO inference confidence
+        self.iou = iou    # YOLO IoU threshold
+        
+        # Config parameters for detection logic
+        self.confidence_threshold = confidence_threshold  # Minimum confidence for detection
+        self.violation_threshold = violation_threshold    # Frames needed to confirm violation
+        self.helmet_class_id = helmet_class_id            # Optional: override helmet class
+        self.person_class_id = person_class_id            # Optional: override person class
+        
+        # Only load model if path is provided (allows mock testing)
+        if model_path:
+            self.load_model(model_path)
         
         # 類別映射表：將模型標籤映射到系統邏輯標籤
         self.class_map = {
@@ -29,14 +57,18 @@ class HelmetDetector:
         
         # 穩定性過濾：記錄每個人的缺失狀態 (Person ID -> Deque of missing items)
         # 註：由於 YOLOv8 預設不帶 Tracking，這裡簡化為「全域連續幀判定」
-        self.violation_buffer = deque(maxlen=5) # 記錄最近 5 幀的違規狀態
+        self.violation_buffer = deque(maxlen=max(5, violation_threshold))
 
     def load_model(self, path):
+        """Load YOLO model with lazy import."""
         try:
+            YOLO = _get_yolo()
             self.model = YOLO(path)
-            return True, f"成功載入模型: {path}"
+            return True, f"成功載入模型：{path}"
+        except ImportError as e:
+            return False, f"模型載入失敗 (缺少 ultralytics): {str(e)}"
         except Exception as e:
-            return False, f"模型載入失敗: {str(e)}"
+            return False, f"模型載入失敗：{str(e)}"
 
     def get_model_classes(self):
         if not self.model: return []
@@ -115,9 +147,9 @@ class HelmetDetector:
                 self.violation_coords.append(((p_box[0]+p_box[2])/2, (p_box[1]+p_box[3])/2))
 
         # 3. 穩定性過濾 (Temporal Smoothing)
-        # 只有當最近 5 幀中有 3 幀以上出現違規，才判定為真實違規
+        # 只有當最近 N 幀中有 threshold 幀以上出現違規，才判定為真實違規
         self.violation_buffer.append(len(frame_violations) > 0)
-        is_stable_violation = sum(self.violation_buffer) >= 3
+        is_stable_violation = sum(self.violation_buffer) >= self.violation_threshold
         
         # 整理缺失項目清單
         all_missing = [item for sublist in frame_violations for item in sublist]

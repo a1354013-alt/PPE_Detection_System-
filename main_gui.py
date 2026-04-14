@@ -122,7 +122,6 @@ class HelmetDetectionApp:
                 unsupported.append(item)
         
         if unsupported:
-            messagebox.set_warning = True # 標記警告
             msg = f"警告：當前模型不包含以下類別：\n{', '.join(unsupported)}\n系統將跳過這些項目的判定。"
             messagebox.showwarning("類別不匹配", msg)
 
@@ -186,8 +185,9 @@ class HelmetDetectionApp:
         last_cap_time = 0
         while self.running:
             ret, frame = self.vid.read()
-            if not ret: break
-            
+            # 先判斷 ret，再判斷 frame，避免攝影機讀取失敗時異常空轉
+            if not ret or frame is None:
+                break
             display_frame = cv2.resize(frame, (800, 500))
             targets = [k for k, v in self.check_vars.items() if v.get()]
             annotated, info = self.detector.detect(display_frame, targets)

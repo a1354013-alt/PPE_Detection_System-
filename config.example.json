@@ -1,0 +1,19 @@
+{
+  "_comment": "PPE Detection System Configuration",
+  "model": {
+    "path": "yolov8n.pt",
+    "confidence_threshold": 0.4,
+    "iou_threshold": 0.45
+  },
+  "detection": {
+    "violation_threshold": 3,
+    "helmet_class_id": null,
+    "person_class_id": 0
+  },
+  "items": {
+    "helmet": true,
+    "vest": false,
+    "goggles": false,
+    "mask": false
+  }
+}
