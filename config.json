@@ -1,0 +1,6 @@
+{
+  "confidence_threshold": 0.5,
+  "iou_threshold": 0.3,
+  "temporal_frames": 3,
+  "cooldown_seconds": 2
+}

@@ -1,14 +1,26 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from collections import deque
+from collections import deque, Counter
+import json
+import csv
+import os
+from datetime import datetime
+
 
 class HelmetDetector:
-    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45):
+    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45, config_path='config.json'):
         self.model = None
         self.model_path = model_path
-        self.conf = conf
-        self.iou = iou
+        self.config_path = config_path
+        self.config = self.load_config(config_path)
+        
+        # 從 config 讀取閾值（優先級：config > 參數 > 預設值）
+        self.conf = self.config.get('confidence_threshold', conf)
+        self.iou = self.config.get('iou_threshold', iou)
+        self.temporal_frames = self.config.get('temporal_frames', 3)
+        self.cooldown_seconds = self.config.get('cooldown_seconds', 2)
+        
         self.load_model(model_path)
         
         # 類別映射表：將模型標籤映射到系統邏輯標籤
@@ -24,22 +36,43 @@ class HelmetDetector:
             'face_mask': 'mask'
         }
         
-        # 違規座標記錄
+        # 違規座標記錄（僅在穩定判定後記錄）
         self.violation_coords = []
         
-        # 穩定性過濾：記錄每個人的缺失狀態 (Person ID -> Deque of missing items)
-        # 註：由於 YOLOv8 預設不帶 Tracking，這裡簡化為「全域連續幀判定」
-        self.violation_buffer = deque(maxlen=5) # 記錄最近 5 幀的違規狀態
+        # Person-based temporal buffer: person_index -> deque of missing items
+        # 使用簡化的 index-based tracking
+        self.person_buffers = {}  # person_index -> deque
+        
+        # Violation log
+        self.violation_log = []
+
+    def load_config(self, config_path):
+        """載入配置文件，若不存在則返回預設配置"""
+        default_config = {
+            "confidence_threshold": 0.5,
+            "iou_threshold": 0.3,
+            "temporal_frames": 3,
+            "cooldown_seconds": 2
+        }
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return default_config
+        return default_config
 
     def load_model(self, path):
         try:
             self.model = YOLO(path)
-            return True, f"成功載入模型: {path}"
+            self.model_path = path  # 確保 model_path 同步
+            return True, f"成功載入模型：{path}"
         except Exception as e:
-            return False, f"模型載入失敗: {str(e)}"
+            return False, f"模型載入失敗：{str(e)}"
 
     def get_model_classes(self):
-        if not self.model: return []
+        if not self.model:
+            return []
         # 取得模型原始類別並經過映射轉換
         raw_names = self.model.names.values()
         mapped_names = set()
@@ -47,27 +80,67 @@ class HelmetDetector:
             mapped_names.add(self.class_map.get(name.lower(), name.lower()))
         return list(mapped_names)
 
-    def is_overlapping(self, box_person, box_item, ratio=0.3):
+    def get_person_zones(self, person_box):
         """
-        優化後的空間關聯判定
-        ratio: 判定裝備必須在人體上方多少比例的區間內 (預設 0.3 代表頭部區域)
+        將人體邊框劃分為多個區域，供不同 PPE 項目使用
+        
+        回傳格式：
+        {
+            "head": (x1, y1, x2, y2),        # 上 25% - helmet
+            "face_upper": (x1, y1, x2, y2),  # 上 40% - goggles
+            "face_lower": (x1, y1, x2, y2),  # 40% ~ 60% - mask
+            "torso": (x1, y1, x2, y2)        # 30% ~ 80% - vest
+        }
         """
-        px1, py1, px2, py2 = box_person
+        px1, py1, px2, py2 = person_box
+        person_height = py2 - py1
+        
+        # head: 上 25%
+        head_h = int(person_height * 0.25)
+        head_zone = (px1, py1, px2, py1 + head_h)
+        
+        # face_upper: 上 40%
+        face_upper_h = int(person_height * 0.40)
+        face_upper_zone = (px1, py1, px2, py1 + face_upper_h)
+        
+        # face_lower: 40% ~ 60%
+        face_lower_y1 = int(py1 + person_height * 0.40)
+        face_lower_y2 = int(py1 + person_height * 0.60)
+        face_lower_zone = (px1, face_lower_y1, px2, face_lower_y2)
+        
+        # torso: 30% ~ 80%
+        torso_y1 = int(py1 + person_height * 0.30)
+        torso_y2 = int(py1 + person_height * 0.80)
+        torso_zone = (px1, torso_y1, px2, torso_y2)
+        
+        return {
+            "head": head_zone,
+            "face_upper": face_upper_zone,
+            "face_lower": face_lower_zone,
+            "torso": torso_zone
+        }
+
+    def is_overlapping_with_zone(self, box_item, zone_box):
+        """
+        檢查物品是否在指定的 PPE 區域內
+        
+        zone_box: 該 PPE 對應的人體區域 (head/face_upper/face_lower/torso)
+        """
         ix1, iy1, ix2, iy2 = box_item
+        zx1, zy1, zx2, zy2 = zone_box
         
         icx = (ix1 + ix2) / 2
         icy = (iy1 + iy2) / 2
         
-        # 1. 中心點必須在人的寬度內
-        in_width = px1 <= icx <= px2
+        # 中心點必須在區域的寬度內
+        in_width = zx1 <= icx <= zx2
         
-        # 2. 裝備中心點必須在人的頂部區域 (py1 ~ py1 + height * ratio)
-        person_height = py2 - py1
-        in_head_zone = py1 - (person_height * 0.1) <= icy <= (py1 + person_height * ratio)
+        # 中心點必須在區域的高度內
+        in_height = zy1 <= icy <= zy2
         
-        return in_width and in_head_zone
+        return in_width and in_height
 
-    def detect(self, frame, target_items):
+    def detect(self, frame, target_items, frame_number=0):
         if self.model is None:
             return frame, {'error': '模型未載入'}
 
@@ -91,42 +164,95 @@ class HelmetDetector:
                 items[mapped_label].append(coords)
         
         annotated_frame = result.plot()
-        frame_violations = []
+        frame_violations = []  # List of (person_index, missing_items, person_box)
         
-        # 2. 空間關聯判定
-        for p_box in persons:
+        # 2. 空間關聯判定 - 使用正確的 PPE 區域
+        for idx, p_box in enumerate(persons):
+            zones = self.get_person_zones(p_box)
             person_missing = []
+            
             for target in target_items:
                 # 檢查該目標是否在模型支援範圍內
                 if not any(self.class_map.get(n.lower(), n.lower()) == target for n in names.values()):
-                    continue # 模型不支援此類別，跳過判定
+                    continue  # 模型不支援此類別，跳過判定
                 
-                found = any(self.is_overlapping(p_box, i_box) for i_box in items[target])
+                # 根據 PPE 類型選擇正確的區域
+                if target == "helmet":
+                    zone = zones["head"]
+                elif target == "goggles":
+                    zone = zones["face_upper"]
+                elif target == "mask":
+                    zone = zones["face_lower"]
+                elif target == "vest":
+                    zone = zones["torso"]
+                else:
+                    zone = zones["head"]  # 預設 fallback
+                
+                # 檢查該 PPE 是否在正確區域內
+                found = any(
+                    self.is_overlapping_with_zone(i_box, zone) 
+                    for i_box in items[target]
+                )
+                
                 if not found:
                     person_missing.append(target)
             
             if person_missing:
-                frame_violations.append(person_missing)
+                frame_violations.append((idx, person_missing, p_box))
                 # 繪製警告
                 cv2.putText(annotated_frame, f"MISSING: {', '.join(person_missing)}", 
                             (int(p_box[0]), int(p_box[1]) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                # 記錄座標
-                self.violation_coords.append(((p_box[0]+p_box[2])/2, (p_box[1]+p_box[3])/2))
 
-        # 3. 穩定性過濾 (Temporal Smoothing)
-        # 只有當最近 5 幀中有 3 幀以上出現違規，才判定為真實違規
-        self.violation_buffer.append(len(frame_violations) > 0)
-        is_stable_violation = sum(self.violation_buffer) >= 3
+        # 3. Person-based Temporal Smoothing
+        # 清理不再存在的 person index
+        current_indices = set(range(len(persons)))
+        stale_indices = set(self.person_buffers.keys()) - current_indices
+        for stale_idx in stale_indices:
+            del self.person_buffers[stale_idx]
         
+        # 為每個人更新 buffer
+        stable_violations = []  # (person_index, missing_items, person_box)
+        
+        for idx, missing_items, p_box in frame_violations:
+            if idx not in self.person_buffers:
+                self.person_buffers[idx] = deque(maxlen=self.temporal_frames)
+            
+            # 記錄缺失狀態（使用 frozenset 以便比較）
+            missing_set = frozenset(missing_items)
+            self.person_buffers[idx].append(missing_set)
+            
+            # 檢查是否穩定：最近 N 幀中有足夠次數出現相同的缺失
+            if len(self.person_buffers[idx]) >= self.temporal_frames:
+                recent_states = list(self.person_buffers[idx])
+                # 計算最常見的缺失組合
+                state_counts = Counter(recent_states)
+                most_common_state, count = state_counts.most_common(1)[0]
+                
+                # 如果最常見狀態出現次數達到閾值，判定為穩定違規
+                if count >= self.temporal_frames - 1:  # 允許 1 幀誤差
+                    stable_violations.append((idx, list(most_common_state), p_box))
+                    # 僅在穩定判定後才記錄座標
+                    self.violation_coords.append(((p_box[0]+p_box[2])/2, (p_box[1]+p_box[3])/2))
+                    
+                    # 記錄 violation log
+                    self.violation_log.append({
+                        'frame': frame_number,
+                        'person_id': idx,
+                        'missing_items': list(most_common_state),
+                        'coords': ((p_box[0]+p_box[2])/2, (p_box[1]+p_box[3])/2)
+                    })
+
         # 整理缺失項目清單
-        all_missing = [item for sublist in frame_violations for item in sublist]
+        all_missing = [item for _, items, _ in stable_violations for item in items]
         unique_missing = list(set(all_missing))
+        is_stable_violation = len(stable_violations) > 0
 
         return annotated_frame, {
             'person_count': len(persons),
             'violation_detected': is_stable_violation,
-            'missing_items': unique_missing if is_stable_violation else []
+            'missing_items': unique_missing if is_stable_violation else [],
+            'stable_violations': stable_violations
         }
 
     def generate_heatmap(self, shape):
@@ -136,3 +262,33 @@ class HelmetDetector:
         heatmap = cv2.GaussianBlur(heatmap, (51, 51), 0)
         heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
         return cv2.applyColorMap(heatmap.astype(np.uint8), cv2.COLORMAP_JET)
+
+    def save_violation_log(self, filepath='violations/violations.csv'):
+        """將違規記錄儲存為 CSV"""
+        if not self.violation_log:
+            return False
+        
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'frame', 'person_id', 'missing_items', 'center_x', 'center_y'])
+            
+            for entry in self.violation_log:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                writer.writerow([
+                    timestamp,
+                    entry['frame'],
+                    entry['person_id'],
+                    ';'.join(entry['missing_items']),
+                    entry['coords'][0],
+                    entry['coords'][1]
+                ])
+        
+        return True
+
+    def reset(self):
+        """重置偵測狀態"""
+        self.violation_coords.clear()
+        self.person_buffers.clear()
+        self.violation_log.clear()
