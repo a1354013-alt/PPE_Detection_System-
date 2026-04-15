@@ -165,7 +165,6 @@ class HelmetDetectionApp:
                 unsupported.append(item)
         
         if unsupported:
-            messagebox.set_warning = True # 標記警告
             msg = f"警告：當前模型不包含以下類別：\n{', '.join(unsupported)}\n系統將跳過這些項目的判定。"
             messagebox.showwarning("類別不匹配", msg)
 

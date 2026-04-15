@@ -1,14 +1,38 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 from collections import deque
 
+
+def _get_yolo():
+    """
+    延遲載入 YOLO，避免在未安裝 ultralytics 時 import 失敗
+    
+    Returns:
+        YOLO class: ultralytics.YOLO 類別
+        
+    Raises:
+        ImportError: 當 ultralytics 未安裝時
+    """
+    try:
+        from ultralytics import YOLO
+        return YOLO
+    except ImportError as e:
+        raise ImportError(
+            "ultralytics 套件未安裝。請執行：pip install ultralytics"
+        ) from e
+
+
 class HelmetDetector:
-    def __init__(self, model_path='yolov8n.pt', confidence_threshold=0.4, iou_threshold=0.45):
+    def __init__(self, model_path='yolov8n.pt', confidence_threshold=0.4, 
+                 iou_threshold=0.45, violation_threshold=3,
+                 helmet_class_id=0, person_class_id=0):
         self.model = None
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
+        self.violation_threshold = violation_threshold
+        self.helmet_class_id = helmet_class_id
+        self.person_class_id = person_class_id
         self.load_model(model_path)
         
         # 類別映射表：將模型標籤映射到系統邏輯標籤
@@ -20,19 +44,20 @@ class HelmetDetector:
             'reflective_vest': 'vest',
             'goggles': 'goggles',
             'eye_protection': 'goggles',
-            'mask': 'mask',
+            'mask': 'face_mask',
             'face_mask': 'mask'
         }
         
         # 違規座標記錄
         self.violation_coords = []
         
-        # 穩定性過濾：記錄每個人的缺失狀態 (Person ID -> Deque of missing items)
-        # 註：由於 YOLOv8 預設不帶 Tracking，這裡簡化為「全域連續幀判定」
-        self.violation_buffer = deque(maxlen=5) # 記錄最近 5 幀的違規狀態
+        # 穩定性過濾：使用 violation_threshold 作為 buffer 大小
+        # 判定條件：buffer 中超過一半幀數出現違規才認定為真實違規
+        self.violation_buffer = deque(maxlen=violation_threshold)
 
     def load_model(self, path):
         try:
+            YOLO = _get_yolo()
             self.model = YOLO(path)
             return True, f"成功載入模型: {path}"
         except Exception as e:
@@ -115,9 +140,9 @@ class HelmetDetector:
                 self.violation_coords.append(((p_box[0]+p_box[2])/2, (p_box[1]+p_box[3])/2))
 
         # 3. 穩定性過濾 (Temporal Smoothing)
-        # 只有當最近 5 幀中有 3 幀以上出現違規，才判定為真實違規
+        # 使用 violation_threshold 作為判定門檻：buffer 中超過一半幀數出現違規才認定為真實違規
         self.violation_buffer.append(len(frame_violations) > 0)
-        is_stable_violation = sum(self.violation_buffer) >= 3
+        is_stable_violation = sum(self.violation_buffer) >= (len(self.violation_buffer) + 1) // 2
         
         # 整理缺失項目清單
         all_missing = [item for sublist in frame_violations for item in sublist]
