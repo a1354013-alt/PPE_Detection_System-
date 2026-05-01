@@ -9,19 +9,22 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from helmet_detector import HelmetDetector
+from event_logger import EventLogger, ViolationEvent
 import queue
 
 class HelmetDetectionApp:
     def __init__(self, window, window_title):
         self.window = window
         self.window.title(window_title)
-        self.window.geometry("1300x900")
+        self.window.geometry("1400x950")
         self.window.configure(bg="#1e1e1e")
 
-        # 初始化偵測器
+        # 初始化偵測器與事件記錄器
         self.detector = HelmetDetector()
+        self.event_logger = EventLogger()
         self.running = False
         self.vid = None
+        self.source_name = "unknown"
         
         # 執行緒安全隊列
         self.result_queue = queue.Queue()
@@ -47,12 +50,40 @@ class HelmetDetectionApp:
         self.main_frame.pack(pady=10, fill=tk.BOTH, expand=True)
 
         # 左側影像區
-        self.canvas = tk.Canvas(self.main_frame, width=800, height=500, bg="#000000", highlightthickness=0)
-        self.canvas.pack(side=tk.LEFT, padx=20)
+        self.left_panel = tk.Frame(self.main_frame, bg="#1e1e1e")
+        self.left_panel.pack(side=tk.LEFT, padx=20, fill=tk.BOTH, expand=True)
+        
+        self.canvas = tk.Canvas(self.left_panel, width=800, height=500, bg="#000000", highlightthickness=0)
+        self.canvas.pack(pady=5)
+
+        # 違規事件列表 (Treeview)
+        self.tree_frame = ttk.LabelFrame(self.left_panel, text="即時違規事件列表")
+        self.tree_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        columns = ("time", "track_id", "missing", "conf", "screenshot")
+        self.tree = ttk.Treeview(self.tree_frame, columns=columns, show="headings", height=8)
+        self.tree.heading("time", text="時間")
+        self.tree.heading("track_id", text="人員 ID")
+        self.tree.heading("missing", text="缺少裝備")
+        self.tree.heading("conf", text="信心分數")
+        self.tree.heading("screenshot", text="截圖路徑")
+        
+        self.tree.column("time", width=150)
+        self.tree.column("track_id", width=100)
+        self.tree.column("missing", width=200)
+        self.tree.column("conf", width=80)
+        self.tree.column("screenshot", width=250)
+        
+        scrollbar = ttk.Scrollbar(self.tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
 
         # 右側資訊欄
         self.right_frame = tk.Frame(self.main_frame, bg="#1e1e1e")
-        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=20)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=20, width=400)
 
         # 1. 模型管理
         self.model_frame = ttk.LabelFrame(self.right_frame, text="模型管理")
@@ -68,17 +99,24 @@ class HelmetDetectionApp:
         self.ax.set_facecolor('#1e1e1e')
         self.ax.tick_params(colors='white')
         self.chart_canvas = FigureCanvasTkAgg(self.fig, master=self.right_frame)
-        self.chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.chart_canvas.get_tk_widget().pack(fill=tk.X, pady=5)
 
         # 3. 統計數值
         self.stats_frame = ttk.LabelFrame(self.right_frame, text="即時統計")
-        self.stats_frame.pack(fill=tk.X, pady=10)
+        self.stats_frame.pack(fill=tk.X, pady=5)
         self.lbl_total_v = tk.Label(self.stats_frame, text="累計違規: 0", font=("Arial", 14, "bold"), bg="#1e1e1e", fg="#ff4b2b")
         self.lbl_total_v.pack(pady=5)
 
+        # 4. 報告匯出
+        self.export_frame = ttk.LabelFrame(self.right_frame, text="報告匯出")
+        self.export_frame.pack(fill=tk.X, pady=10)
+        tk.Button(self.export_frame, text="匯出 CSV 報告", command=lambda: self.export_report("csv"), bg="#2d4059", fg="white").pack(fill=tk.X, pady=2)
+        tk.Button(self.export_frame, text="匯出 Excel 報告", command=lambda: self.export_report("xlsx"), bg="#2d4059", fg="white").pack(fill=tk.X, pady=2)
+        tk.Button(self.export_frame, text="匯出 PDF 報告", command=lambda: self.export_report("pdf"), bg="#2d4059", fg="white").pack(fill=tk.X, pady=2)
+
         # --- 底部控制區 ---
         self.bottom_frame = tk.Frame(self.window, bg="#1e1e1e")
-        self.bottom_frame.pack(pady=20, fill=tk.X)
+        self.bottom_frame.pack(pady=10, fill=tk.X)
 
         # 偵測項目勾選
         self.check_frame = tk.Frame(self.bottom_frame, bg="#1e1e1e")
@@ -97,7 +135,7 @@ class HelmetDetectionApp:
         self.btn_upload.grid(row=0, column=0, padx=10)
         self.btn_camera = tk.Button(self.btn_frame, text="開啟攝影機", command=self.open_camera, bg="#00adb5", fg="white", **btn_style)
         self.btn_camera.grid(row=0, column=1, padx=10)
-        self.btn_stop = tk.Button(self.btn_frame, text="停止並生成報告", command=self.stop_and_report, bg="#ff4b2b", fg="white", **btn_style)
+        self.btn_stop = tk.Button(self.btn_frame, text="停止並生成熱力圖", command=self.stop_and_report, bg="#ff4b2b", fg="white", **btn_style)
         self.btn_stop.grid(row=0, column=2, padx=10)
 
         self.update_chart()
@@ -107,6 +145,7 @@ class HelmetDetectionApp:
         if path:
             success, msg = self.detector.load_model(path)
             if success:
+                self.detector.reset_tracking()
                 self.lbl_model.config(text=f"當前模型: {os.path.basename(path)}")
                 self.validate_model_support()
                 messagebox.showinfo("成功", msg)
@@ -114,7 +153,6 @@ class HelmetDetectionApp:
                 messagebox.showerror("錯誤", msg)
 
     def validate_model_support(self):
-        """ 檢查模型是否支援勾選的類別 """
         model_classes = self.detector.get_model_classes()
         unsupported = []
         for item, var in self.check_vars.items():
@@ -122,7 +160,6 @@ class HelmetDetectionApp:
                 unsupported.append(item)
         
         if unsupported:
-            messagebox.set_warning = True # 標記警告
             msg = f"警告：當前模型不包含以下類別：\n{', '.join(unsupported)}\n系統將跳過這些項目的判定。"
             messagebox.showwarning("類別不匹配", msg)
 
@@ -136,14 +173,13 @@ class HelmetDetectionApp:
         self.chart_canvas.draw()
 
     def check_queue(self):
-        """ 輪詢隊列以更新 UI (Thread-safe) """
         try:
             while True:
                 task_type, data = self.result_queue.get_nowait()
                 if task_type == "FRAME":
                     self.render_frame(data)
-                elif task_type == "STATS":
-                    self.update_stats_ui(data)
+                elif task_type == "EVENT":
+                    self.add_event_to_ui(data)
                 elif task_type == "STOP":
                     self.handle_stop()
         except queue.Empty:
@@ -157,19 +193,66 @@ class HelmetDetectionApp:
         self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
         self.canvas.imgtk = imgtk
 
-    def update_stats_ui(self, info):
+    def add_event_to_ui(self, event_dict):
+        # 更新統計
         self.stats['total_violations'] += 1
-        for m in info['missing_items']:
+        for m in event_dict['missing_list']:
             if m in self.stats['missing_counts']:
                 self.stats['missing_counts'][m] += 1
         self.lbl_total_v.config(text=f"累計違規: {self.stats['total_violations']}")
         self.update_chart()
+        
+        # 更新列表 (插入到最上方)
+        self.tree.insert("", 0, values=(
+            event_dict['timestamp'],
+            event_dict['track_id'],
+            event_dict['missing_items'],
+            f"{event_dict['confidence']:.2f}",
+            event_dict['screenshot_path']
+        ))
+        
+        # 限制列表顯示數量
+        if len(self.tree.get_children()) > 1000:
+            self.tree.delete(self.tree.get_children()[-1])
+
+    def on_tree_double_click(self, event):
+        item = self.tree.selection()[0]
+        screenshot_path = self.tree.item(item, "values")[4]
+        if screenshot_path and os.path.exists(screenshot_path):
+            # 在 Linux 下使用 xdg-open 開啟圖片
+            os.system(f"xdg-open {screenshot_path}")
+        else:
+            messagebox.showwarning("提示", "找不到截圖檔案")
+
+    def export_report(self, fmt):
+        if not self.event_logger.events:
+            messagebox.showwarning("提示", "目前沒有違規事件可供匯出")
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"ppe_violation_report_{timestamp}.{fmt}"
+        
+        try:
+            if fmt == "csv":
+                path = self.event_logger.export_csv(filename)
+            elif fmt == "xlsx":
+                path = self.event_logger.export_excel(filename, self.stats)
+            elif fmt == "pdf":
+                path = self.event_logger.export_pdf(filename, self.stats)
+            
+            messagebox.showinfo("成功", f"報告已匯出至：{path}")
+        except Exception as e:
+            messagebox.showerror("錯誤", f"匯出失敗：{str(e)}")
 
     def open_file(self):
         path = filedialog.askopenfilename()
-        if path: self.start_detection(path)
+        if path: 
+            self.source_name = os.path.basename(path)
+            self.start_detection(path)
 
-    def open_camera(self): self.start_detection(0)
+    def open_camera(self): 
+        self.source_name = "camera_0"
+        self.start_detection(0)
 
     def start_detection(self, source):
         if self.running: return
@@ -177,6 +260,13 @@ class HelmetDetectionApp:
         if not self.vid.isOpened():
             messagebox.showerror("錯誤", "無法開啟影像來源")
             return
+        
+        # 重置狀態
+        self.detector.reset_tracking()
+        self.event_logger.clear_events()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
         self.running = True
         self.btn_upload.config(state=tk.DISABLED)
         self.btn_camera.config(state=tk.DISABLED)
@@ -190,21 +280,40 @@ class HelmetDetectionApp:
             
             display_frame = cv2.resize(frame, (800, 500))
             targets = [k for k, v in self.check_vars.items() if v.get()]
-            annotated, info = self.detector.detect(display_frame, targets)
+            annotated, info = self.detector.detect(display_frame, targets, self.source_name)
             
-            # 發送影像到 UI
             self.result_queue.put(("FRAME", annotated))
             
-            # 處理違規邏輯
             if info.get('violation_detected'):
-                curr_time = time.time()
-                if curr_time - last_cap_time > 3: # 3秒冷卻
-                    self.result_queue.put(("STATS", info))
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    cv2.imwrite(f"violations/v_{timestamp}.jpg", annotated)
-                    last_cap_time = curr_time
+                new_events = info.get('new_events', [])
+                for event_data in new_events:
+                    # 截圖邏輯 (全域冷卻 3 秒)
+                    curr_time = time.time()
+                    screenshot_path = ""
+                    if curr_time - last_cap_time > 3:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        screenshot_path = f"violations/v_{ts}_{event_data['track_id']}.jpg"
+                        cv2.imwrite(screenshot_path, annotated)
+                        last_cap_time = curr_time
+                    
+                    # 建立事件物件並記錄
+                    event = ViolationEvent(
+                        timestamp=event_data['timestamp'],
+                        source=event_data['source'],
+                        track_id=event_data['track_id'],
+                        person_count=event_data['person_count'],
+                        missing_items=event_data['missing_items'],
+                        screenshot_path=screenshot_path,
+                        confidence=event_data['confidence'],
+                        bbox=event_data['bbox']
+                    )
+                    self.event_logger.add_event(event)
+                    
+                    # 發送到 UI 更新 (包含 event_data 方便 UI 使用)
+                    event_data['screenshot_path'] = screenshot_path
+                    self.result_queue.put(("EVENT", event_data))
             
-            time.sleep(0.01) # 稍微讓出 CPU
+            time.sleep(0.01)
         self.result_queue.put(("STOP", None))
 
     def handle_stop(self):
@@ -219,7 +328,7 @@ class HelmetDetectionApp:
         if self.detector.violation_coords:
             heatmap = self.detector.generate_heatmap((500, 800))
             cv2.imwrite("violation_heatmap.jpg", heatmap)
-            messagebox.showinfo("報告", "報告已生成：violation_heatmap.jpg")
+            messagebox.showinfo("報告", "熱力圖已生成：violation_heatmap.jpg")
         else:
             messagebox.showinfo("提示", "偵測結束，無違規記錄。")
 
@@ -230,4 +339,5 @@ class HelmetDetectionApp:
 if __name__ == "__main__":
     root = tk.Tk()
     app = HelmetDetectionApp(root, "PPE 智慧監控系統 Pro")
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
