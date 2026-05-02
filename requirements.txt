@@ -3,3 +3,6 @@ opencv-python
 pillow
 matplotlib
 numpy
+openpyxl
+reportlab
+pandas

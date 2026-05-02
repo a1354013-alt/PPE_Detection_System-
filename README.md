@@ -1,13 +1,22 @@
-# PPE 智慧監控系統 Pro - 技術說明文件
+# PPE 智慧監控系統 - 專業版 (PPE Detection System Pro)
 
-本專案為工業環境設計的個人防護裝備 (PPE) 自動化偵測系統，基於 YOLOv8 與 Python Tkinter 開發。
+本系統是一款基於 YOLOv8 的個人防護裝備 (PPE) 自動化偵測系統，專為工業安全監控設計。系統能即時識別人員是否佩戴安全帽、反光背心、護目鏡及口罩，並提供完整的違規事件追蹤與報告匯出功能。
+
+## 核心功能
+
+- **即時 PPE 偵測**：支援安全帽、背心、護目鏡、口罩等多種裝備。
+- **人員追蹤 (Tracking)**：整合 YOLOv8 官方 Tracking 機制，並實作基於空間位置的 Fallback ID，確保以「人員」為單位進行精確統計。
+- **違規事件列表**：即時顯示違規時間、人員 ID、缺失項目及信心分數。
+- **自動截圖存證**：偵測到違規時自動儲存現場畫面。
+- **多格式報告匯出**：支援匯出 CSV、Excel 及 PDF 格式的完整違規報告。
+- **熱力圖分析**：統計違規高發區域，生成視覺化熱力圖。
 
 ## 🛠 環境需求 (Requirements)
 
 請確保已安裝以下套件：
 
 ```bash
-pip install ultralytics opencv-python pillow matplotlib
+pip install -r requirements.txt
 ```
 
 ## 📂 模型權重配置 (Model Configuration)
@@ -87,6 +96,41 @@ pip install ultralytics opencv-python pillow matplotlib
 - `iou_threshold`: NMS IoU 閾值
 - `temporal_frames`: 時間平滑幀數
 - `cooldown_seconds`: 違規截圖冷卻時間（秒）
+主要相依套件包括：`ultralytics`, `opencv-python`, `pillow`, `matplotlib`, `pandas`, `openpyxl`, `reportlab`。
+
+## 🚀 核心優化說明
+
+- **Thread-Safe UI**：採用 `queue.Queue` 與 `window.after` 機制，確保背景偵測執行緒不會干擾 Tkinter 主執行緒，解決畫面卡死問題。
+- **空間關聯判定**：裝備必須位於人體上方 30% 區域（頭部區）才判定為合格，避免背景誤報。
+- **穩定性過濾**：引入連續幀判定機制（5 幀中需有 3 幀違規），過濾掉單幀的偵測抖動。
+- **精細化冷卻機制**：以 `(track_id, violation_type)` 為單位的冷卻邏輯，並具備人員狀態自動清理功能（TTL 機制），避免同一人在短時間內重複計入統計。
+
+## 📂 使用流程
+
+1. **啟動系統**：執行 `python main_gui.py`。
+2. **載入模型**：預設使用 `yolov8n.pt`，可點擊「更換模型」載入自定義權重。
+3. **選擇偵測項目**：在下方勾選欲監控的 PPE 項目。
+4. **開始偵測**：
+   - 點擊「上傳影片」分析現有影片檔。
+   - 點擊「開啟攝影機」進行現場即時監控。
+5. **查看事件**：違規事件會即時出現在左下方的列表中，雙擊事件可開啟對應截圖。
+6. **匯出報告**：偵測結束後，點擊右側的匯出按鈕生成 CSV、Excel 或 PDF 報告。
+
+## 📊 報告說明
+
+### 匯出格式
+- **CSV**：採用 UTF-8 with BOM 編碼，確保 Excel 開啟不亂碼。
+- **Excel**：包含「事件明細」與「統計摘要」兩個工作表。
+- **PDF**：包含統計摘要圖表、事件明細表，以及最近 5 筆違規事件的截圖展示。
+
+### 報告欄位
+- **Timestamp**：違規發生時間。
+- **Source**：影像來源名稱。
+- **Track ID**：人員追蹤編號。
+- **Missing Items**：缺失的防護裝備。
+- **Confidence**：偵測信心分數。
+- **Screenshot Path**：截圖檔案路徑。
+- **BBox**：人員在畫面中的座標位置。
 
 ## ❓ 常見問題 (FAQ)
 
@@ -121,3 +165,6 @@ python main_gui.py
 2. **Temporal smoothing 為簡化版本**，使用 person index 而非真實 tracking ID。
 3. **Heatmap 為位置聚合**，僅供視覺化參考。
 4. 請務必閱讀並理解配置文件參數後再進行調整。
+  - A: 系統預設使用 CPU 推論。若有 NVIDIA GPU，請確保安裝了 `onnxruntime-gpu` 或 `torch` 的 CUDA 版本。
+- **Q: PDF 報告中文字顯示異常？**
+  - A: 目前 PDF 報告優先支援英文內容，若需完整支援中文，需額外配置中文字型檔。
