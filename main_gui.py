@@ -5,6 +5,8 @@ from PIL import Image, ImageTk
 import threading
 import time
 import os
+import sys
+import argparse
 from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -14,15 +16,16 @@ import queue
 
 
 class HelmetDetectionApp:
-    def __init__(self, window, window_title):
+    def __init__(self, window, window_title, demo_mode=False):
         self.window = window
         self.window.title(window_title)
         self.window.geometry("1400x950")
         self.window.configure(bg="#1e1e1e")
 
-        self.detector = HelmetDetector()
+        self.detector = HelmetDetector(demo_mode=demo_mode)
         self.event_logger = EventLogger()
         self.running = False
+        self.demo_mode = demo_mode
 
         self.worker = None
         self.stop_event = threading.Event()
@@ -44,11 +47,16 @@ class HelmetDetectionApp:
 
         self.enabled_items = {}
 
-        if not os.path.exists("violations"):
-            os.makedirs("violations")
+        # 確保輸出目錄存在
+        os.makedirs("reports", exist_ok=True)
+        os.makedirs("violations", exist_ok=True)
 
         self.setup_ui()
         self.check_queue()
+        
+        # 如果是 Demo Mode，顯示提示
+        if self.demo_mode:
+            self.window.after(500, self.show_demo_info)
 
     def setup_ui(self):
         self.top_frame = tk.Frame(self.window, bg="#1e1e1e")
