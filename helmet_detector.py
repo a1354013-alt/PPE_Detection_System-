@@ -34,6 +34,10 @@ class HelmetDetector:
         self.temporal_frames = self.config.get('temporal_frames', 3)
         self.cooldown_seconds = self.config.get('cooldown_seconds', 2)
 
+        # 確保輸出目錄存在
+        os.makedirs("reports", exist_ok=True)
+        os.makedirs("violations", exist_ok=True)
+
         # 載入模型（如果是 demo mode 且無模型，會稍後處理）
         if not demo_mode or model_path and os.path.exists(model_path):
             self.load_model(model_path)
@@ -69,6 +73,16 @@ class HelmetDetector:
         
         # === Demo Mode 設定 ===
         self.demo_missing_pattern = ['helmet', 'vest']  # Demo Mode 預設缺失
+        
+        # === FPS 計算 ===
+        self.frame_count = 0
+        self.start_time = time.time()
+        
+        # === 影片處理摘要 ===
+        self.processing_start_time = None
+        self.processing_end_time = None
+        self.total_frames_processed = 0
+        self.video_name = ""
 
     def load_config(self, config_path):
         default_config = {
@@ -89,11 +103,47 @@ class HelmetDetector:
 
     def load_model(self, path):
         try:
+            from ultralytics import YOLO
             self.model = YOLO(path)
             self.model_path = path
+            
+            # 檢查模型能力
+            self._check_model_capability()
+            
             return True, f"成功載入模型：{path}"
+        except ImportError:
+            # ultralytics 未安裝，在 demo mode 下可以繼續
+            if self.demo_mode:
+                self.model = None
+                return True, "Demo Mode: 使用模擬檢測結果"
+            return False, "ultralytics 未安裝，請執行 pip install ultralytics"
         except Exception as e:
             return False, f"模型載入失敗：{str(e)}"
+    
+    def _check_model_capability(self):
+        """檢查模型支援的 PPE 類別並顯示"""
+        if not self.model:
+            return
+        
+        required_classes = ["helmet", "vest", "mask", "goggles"]
+        
+        raw_names = self.model.names.values()
+        available_classes = set()
+        
+        for name in raw_names:
+            mapped = self.class_map.get(name.lower(), name.lower())
+            available_classes.add(mapped)
+        
+        print("\n=== Model Capability ===")
+        print(f"person: {'✅' if 'person' in available_classes else '❌'}")
+        for cls in required_classes:
+            status = '✅' if cls in available_classes else '❌'
+            print(f"{cls}: {status}")
+        
+        if self.demo_mode:
+            print("\n⚠️  Running in DEMO MODE")
+            print("Using simulated PPE results")
+        print("========================\n")
 
     def get_model_classes(self):
         if not self.model:
@@ -232,6 +282,7 @@ class HelmetDetector:
         規則：
         1. 每個 (track_id, violation_type) 組合獨立 cooldown
         2. 只有真正回傳給 UI 的事件才寫入 cooldown
+        3. 使用 event_key = (track_id, tuple(sorted(missing_items))) 確保唯一性
         
         回傳：(should_report, updated_cooldown_keys)
         """
@@ -240,6 +291,9 @@ class HelmetDetector:
         
         cooldown_keys = []
         should_report = False
+        
+        # 建立唯一 event key，確保每種 missing_items 組合獨立冷卻
+        event_key = (track_id, tuple(sorted(stable_missing)))
         
         for violation_type in stable_missing:
             key = (track_id, violation_type)
@@ -411,13 +465,22 @@ class HelmetDetector:
             for _, missing_items, _ in stable_violations_output
             for item in missing_items
         ]
+        
+        # FPS 計算
+        self.frame_count += 1
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        
+        # 更新總幀數
+        self.total_frames_processed += 1
 
         return annotated_frame, {
             'person_count': len(persons),
             'violation_detected': len(frame_violations) > 0,
             'missing_items': list(set(all_missing)),
             'stable_violations': stable_violations_output,
-            'new_events': new_event_data  # 直接回傳，不被全域 buffer 過濾
+            'new_events': new_event_data,  # 直接回傳，不被全域 buffer 過濾
+            'fps': fps
         }
 
     def generate_heatmap(self, shape):
@@ -479,6 +542,50 @@ class HelmetDetector:
             self.violation_buffer.clear()
         self.person_buffers.clear()
         self.violation_log.clear()
+        self.frame_count = 0
+        self.start_time = time.time()
+        self.total_frames_processed = 0
+        self.processing_start_time = None
+        self.processing_end_time = None
+        self.video_name = ""
+
+    def generate_processing_summary(self):
+        """產生影片處理摘要"""
+        if self.processing_start_time and self.processing_end_time:
+            processing_time = self.processing_end_time - self.processing_start_time
+            avg_fps = self.total_frames_processed / processing_time if processing_time > 0 else 0
+        else:
+            processing_time = 0
+            avg_fps = 0
+        
+        # 計算最常見的缺失項目
+        missing_counter = {}
+        for event in self.violation_log:
+            for item in event.get('missing_list', []):
+                missing_counter[item] = missing_counter.get(item, 0) + 1
+        
+        most_missing = max(missing_counter, key=missing_counter.get) if missing_counter else "N/A"
+        
+        summary = f"""
+╔═══════════════════════════════════════════╗
+║       Processing Summary                  ║
+╠═══════════════════════════════════════════╣
+║ Video Name: {self.video_name or 'N/A':<30} ║
+║ Start Time: {datetime.fromtimestamp(self.processing_start_time).strftime('%Y-%m-%d %H:%M:%S') if self.processing_start_time else 'N/A':<30} ║
+║ End Time:   {datetime.fromtimestamp(self.processing_end_time).strftime('%Y-%m-%d %H:%M:%S') if self.processing_end_time else 'N/A':<30} ║
+║ Processing Time: {processing_time:.2f}s{' '*15} ║
+╠═══════════════════════════════════════════╣
+║ Total Frames: {self.total_frames_processed:<30} ║
+║ Average FPS:  {avg_fps:.2f}{' '*24} ║
+╠═══════════════════════════════════════════╣
+║ Total Violations: {len(self.violation_log):<26} ║
+║ Most Missing Item: {most_missing:<25} ║
+╠═══════════════════════════════════════════╣
+║ Report Path: reports/{' '*27} ║
+║ Screenshot Path: violations/{' '*19} ║
+╚═══════════════════════════════════════════╝
+"""
+        return summary
 
     def reset(self):
         """完全重置（含配置）"""
@@ -534,9 +641,22 @@ class HelmetDetector:
         new_event_data = []
         stable_violations_output = []
         
+        # Demo Mode: 隨機產生不同的缺失模式，確保 100% 產生事件
+        demo_patterns = [
+            ['helmet'],
+            ['vest'],
+            ['helmet', 'vest'],
+            ['helmet', 'mask'],
+            ['vest', 'goggles'],
+            []  # 偶爾無違規
+        ]
+        
         for p_box, track_id, person_conf in persons:
-            # Demo Mode: 模擬固定的缺失模式
-            person_missing = list(self.demo_missing_pattern)
+            # 隨機選擇缺失模式，但確保大部分情況下有違規
+            if random.random() < 0.8:  # 80% 機率有違規
+                person_missing = random.choice(demo_patterns[:-1])  # 排除空列表
+            else:
+                person_missing = []
             
             # 更新人員狀態
             self.person_states[track_id] = {
@@ -582,7 +702,7 @@ class HelmetDetector:
                         'source': source_name,
                         'track_id': track_id,
                         'person_count': len(persons),
-                        'missing_items': ", ".join(stable_missing),
+                        'missing_items': ", ".join(stable_missing) if stable_missing else "None",
                         'confidence': person_conf,
                         'bbox': bbox_str,
                         'center_x': center_x,
@@ -598,15 +718,16 @@ class HelmetDetector:
                     self.violation_coords.append((center_x, center_y))
                     
                     # 在畫面上標示違規
-                    cv2.putText(
-                        annotated_frame,
-                        f"MISSING: {', '.join(stable_missing)}",
-                        (int(p_box[0]), int(p_box[3]) + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2
-                    )
+                    if stable_missing:
+                        cv2.putText(
+                            annotated_frame,
+                            f"MISSING: {', '.join(stable_missing)}",
+                            (int(p_box[0]), int(p_box[3]) + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 0, 255),
+                            2
+                        )
         
         all_missing = [
             item
@@ -614,11 +735,18 @@ class HelmetDetector:
             for item in missing_items
         ]
         
+        # FPS 計算
+        self.frame_count += 1
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        self.total_frames_processed += 1
+        
         return annotated_frame, {
             'person_count': len(persons),
             'violation_detected': len(stable_violations_output) > 0,
             'missing_items': list(set(all_missing)),
             'stable_violations': stable_violations_output,
             'new_events': new_event_data,
-            'is_demo': True
+            'is_demo': True,
+            'fps': fps
         }
