@@ -9,7 +9,21 @@
 import unittest
 import sys
 import os
+import types
 from unittest.mock import Mock, patch, MagicMock
+
+# Create fake ultralytics module to avoid ModuleNotFoundError
+fake_ultralytics = types.ModuleType("ultralytics")
+
+class FakeYOLO:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def track(self, *args, **kwargs):
+        return []
+
+fake_ultralytics.YOLO = FakeYOLO
+sys.modules["ultralytics"] = fake_ultralytics
 
 # 添加父目錄到 path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

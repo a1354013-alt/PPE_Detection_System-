@@ -6,6 +6,11 @@ import csv
 import os
 import time
 from datetime import datetime
+import random
+
+# Demo Mode 隨機種子，確保每次 Demo 產生相同結果
+DEMO_RANDOM_SEED = 42
+random.seed(DEMO_RANDOM_SEED)
 
 
 class HelmetDetector:
@@ -598,7 +603,6 @@ class HelmetDetector:
         當沒有真實 PPE 模型時，用 person bbox 模擬 PPE 缺失，
         用於展示完整流程（事件、截圖、報告等）。
         """
-        import random
         
         current_time = time.time()
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
