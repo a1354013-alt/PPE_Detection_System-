@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 from collections import deque, Counter
 import json
 import csv
@@ -10,10 +9,24 @@ from datetime import datetime
 
 
 class HelmetDetector:
-    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45, config_path='config.json'):
+    """
+    PPE Detection System - 專業版
+    
+    核心功能：
+    1. 使用 YOLOv8 model.track(..., persist=True) 取得 track_id
+    2. 若 tracking 不可用，fallback 到座標式 ID
+    3. 每個 track_id / fallback_id 獨立判斷違規
+    4. 每種 missing_items 組合獨立 cooldown
+    5. temporal smoothing 只負責判斷「是否穩定違規」
+    6. cooldown 只負責避免重複報告
+    7. new_events 必須可預期、可測試、不可被全域 buffer 吃掉
+    """
+    
+    def __init__(self, model_path='yolov8n.pt', conf=0.4, iou=0.45, config_path='config.json', demo_mode=False):
         self.model = None
         self.model_path = model_path
         self.config_path = config_path
+        self.demo_mode = demo_mode
         self.config = self.load_config(config_path)
 
         self.conf = self.config.get('confidence_threshold', conf)
@@ -21,29 +34,41 @@ class HelmetDetector:
         self.temporal_frames = self.config.get('temporal_frames', 3)
         self.cooldown_seconds = self.config.get('cooldown_seconds', 2)
 
-        self.load_model(model_path)
-
+        # 載入模型（如果是 demo mode 且無模型，會稍後處理）
+        if not demo_mode or model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+        else:
+            self.model = None
+        
+        # 類別映射：將模型輸出的標籤映射到系統標準標籤
         self.class_map = {
             'hardhat': 'helmet',
             'head_helmet': 'helmet',
             'safety_helmet': 'helmet',
+            'helmet': 'helmet',
             'safety_vest': 'vest',
             'reflective_vest': 'vest',
+            'vest': 'vest',
             'goggles': 'goggles',
             'eye_protection': 'goggles',
             'mask': 'mask',
             'face_mask': 'mask'
         }
 
-        self.violation_coords = deque(maxlen=5000)
-        self.violation_buffer = deque(maxlen=5)
-
-        self.person_states = {}
-        self.counted_violations = {}
+        # === 人員追蹤狀態（每個 track_id 獨立）===
+        self.person_states = {}  # track_id -> {last_seen, missing_items, bbox, confidence}
+        self.person_buffers = {}  # track_id -> deque of frozenset(missing_items)
+        
+        # === 冷卻機制（每個 (track_id, violation_type) 組合獨立）===
+        self.counted_violations = {}  # (track_id, violation_type) -> last_count_time
         self.violation_cooldown = float(self.cooldown_seconds)
-
-        self.person_buffers = {}
-        self.violation_log = []
+        
+        # === 違規記錄 ===
+        self.violation_log = []  # 所有事件記錄（用於 CSV 匯出）
+        self.violation_coords = deque(maxlen=5000)  # 熱力圖坐標
+        
+        # === Demo Mode 設定 ===
+        self.demo_missing_pattern = ['helmet', 'vest']  # Demo Mode 預設缺失
 
     def load_config(self, config_path):
         default_config = {
@@ -120,6 +145,10 @@ class HelmetDetector:
         return in_width and in_height
 
     def run_detection_with_tracking(self, frame):
+        """執行 YOLO 偵測，優先使用 tracking 模式"""
+        if self.model is None:
+            return [], False
+            
         try:
             results = self.model.track(
                 frame,
@@ -139,12 +168,14 @@ class HelmetDetector:
             return results, False
 
     def build_fallback_track_id(self, bbox):
+        """根據座標建立 fallback track ID"""
         x1, y1, x2, y2 = bbox
         cx = int((x1 + x2) / 2)
         cy = int((y1 + y2) / 2)
         return f"fallback_{cx // 50}_{cy // 50}"
 
     def cleanup_stale_tracks(self, current_time, ttl=10):
+        """清理超過 TTL 的軌跡狀態"""
         stale_ids = [
             tid for tid, state in self.person_states.items()
             if current_time - state.get("last_seen", 0) > ttl
@@ -154,7 +185,7 @@ class HelmetDetector:
             del self.person_states[tid]
 
             keys_to_del = [
-                key for key in self.counted_violations.keys()
+                key for key in list(self.counted_violations.keys())
                 if key[0] == tid
             ]
 
@@ -164,14 +195,90 @@ class HelmetDetector:
             if tid in self.person_buffers:
                 del self.person_buffers[tid]
 
-    def detect(self, frame, target_items, source_name="unknown", frame_number=0):
-        if self.model is None:
-            return frame, {'error': '模型未載入'}
+    def _check_ppe_missing(self, p_box, items, target_items, supported_classes):
+        """檢查單個人員的 PPE 缺失情況"""
+        zones = self.get_person_zones(p_box)
+        person_missing = []
 
+        for target in target_items:
+            if target not in supported_classes:
+                continue
+
+            if target == "helmet":
+                zone = zones["head"]
+            elif target == "goggles":
+                zone = zones["face_upper"]
+            elif target == "mask":
+                zone = zones["face_lower"]
+            elif target == "vest":
+                zone = zones["torso"]
+            else:
+                zone = zones["head"]
+
+            found = any(
+                self.is_overlapping_with_zone(item_box, zone)
+                for item_box in items.get(target, [])
+            )
+
+            if not found:
+                person_missing.append(target)
+
+        return person_missing
+
+    def _should_report_event(self, track_id, stable_missing, current_time):
+        """
+        判斷是否應該報告新事件。
+        
+        規則：
+        1. 每個 (track_id, violation_type) 組合獨立 cooldown
+        2. 只有真正回傳給 UI 的事件才寫入 cooldown
+        
+        回傳：(should_report, updated_cooldown_keys)
+        """
+        if not stable_missing:
+            return False, []
+        
+        cooldown_keys = []
+        should_report = False
+        
+        for violation_type in stable_missing:
+            key = (track_id, violation_type)
+            last_count_time = self.counted_violations.get(key, 0)
+            
+            if current_time - last_count_time >= self.violation_cooldown:
+                cooldown_keys.append(key)
+                should_report = True
+        
+        return should_report, cooldown_keys
+
+    def detect(self, frame, target_items, source_name="unknown", frame_number=0):
+        """
+        核心偵測函數。
+        
+        事件流程：
+        1. 對每個人員進行 temporal smoothing 判斷穩定違規
+        2. 對穩定違規者檢查 cooldown
+        3. 只有通過 cooldown 檢查的事件才加入 new_events
+        4. new_events 直接回傳給 UI/EventLogger，不被全域 buffer 過濾
+        """
+        # Demo Mode 處理
+        if self.demo_mode or self.model is None:
+            return self._detect_demo(frame, target_items, source_name, frame_number)
+        
         current_time = time.time()
         self.cleanup_stale_tracks(current_time)
 
         results, is_tracking = self.run_detection_with_tracking(frame)
+        
+        if not results:
+            return frame, {
+                'person_count': 0,
+                'violation_detected': False,
+                'missing_items': [],
+                'stable_violations': [],
+                'new_events': []
+            }
+        
         result = results[0]
         names = result.names
 
@@ -198,43 +305,23 @@ class HelmetDetector:
 
         annotated_frame = result.plot()
 
-        frame_violations = []
-        stable_violations = []
-        new_event_data = []
-        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        # 獲取模型支援的類別
         supported_classes = {
             self.class_map.get(name.lower(), name.lower())
             for name in names.values()
         }
 
+        # === 第一階段：對每個人員進行 temporal smoothing ===
+        frame_violations = []  # 本幀所有穩定違規
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         for p_box, track_id, person_conf in persons:
-            zones = self.get_person_zones(p_box)
-            person_missing = []
+            # 檢查 PPE 缺失
+            person_missing = self._check_ppe_missing(
+                p_box, items, target_items, supported_classes
+            )
 
-            for target in target_items:
-                if target not in supported_classes:
-                    continue
-
-                if target == "helmet":
-                    zone = zones["head"]
-                elif target == "goggles":
-                    zone = zones["face_upper"]
-                elif target == "mask":
-                    zone = zones["face_lower"]
-                elif target == "vest":
-                    zone = zones["torso"]
-                else:
-                    zone = zones["head"]
-
-                found = any(
-                    self.is_overlapping_with_zone(item_box, zone)
-                    for item_box in items.get(target, [])
-                )
-
-                if not found:
-                    person_missing.append(target)
-
+            # 更新人員狀態
             self.person_states[track_id] = {
                 "last_seen": current_time,
                 "missing_items": set(person_missing),
@@ -242,11 +329,12 @@ class HelmetDetector:
                 "confidence": person_conf
             }
 
+            # 更新 temporal buffer
             if track_id not in self.person_buffers:
                 self.person_buffers[track_id] = deque(maxlen=self.temporal_frames)
-
             self.person_buffers[track_id].append(frozenset(person_missing))
 
+            # 判斷是否為穩定違規
             if len(self.person_buffers[track_id]) >= self.temporal_frames:
                 recent_states = list(self.person_buffers[track_id])
                 state_counts = Counter(recent_states)
@@ -254,73 +342,82 @@ class HelmetDetector:
 
                 if most_common_state and count >= self.temporal_frames - 1:
                     stable_missing = list(most_common_state)
-                    frame_violations.append((track_id, stable_missing, p_box))
-                    stable_violations.append((track_id, stable_missing, p_box))
+                    frame_violations.append((track_id, stable_missing, p_box, person_conf))
 
-                    cv2.putText(
-                        annotated_frame,
-                        f"ID:{track_id} MISSING: {', '.join(stable_missing)}",
-                        (int(p_box[0]), int(p_box[1]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 0, 255),
-                        2
-                    )
+        # === 第二階段：對穩定違規者檢查 cooldown，產生 new_events ===
+        new_event_data = []
+        stable_violations_output = []
 
-                    center_x = (p_box[0] + p_box[2]) / 2
-                    center_y = (p_box[1] + p_box[3]) / 2
-                    self.violation_coords.append((center_x, center_y))
+        for track_id, stable_missing, p_box, person_conf in frame_violations:
+            # 檢查是否應該報告（cooldown 檢查）
+            should_report, cooldown_keys = self._should_report_event(
+                track_id, stable_missing, current_time
+            )
 
-                    is_new_for_stats = False
+            if should_report:
+                # 寫入 cooldown（只有真正要報告的事件）
+                for key in cooldown_keys:
+                    self.counted_violations[key] = current_time
 
-                    for violation_type in stable_missing:
-                        key = (track_id, violation_type)
-                        last_count_time = self.counted_violations.get(key, 0)
+                # 產生事件資料
+                bbox_str = (
+                    f"x={int(p_box[0])},"
+                    f"y={int(p_box[1])},"
+                    f"w={int(p_box[2] - p_box[0])},"
+                    f"h={int(p_box[3] - p_box[1])}"
+                )
 
-                        if current_time - last_count_time >= self.violation_cooldown:
-                            is_new_for_stats = True
-                            self.counted_violations[key] = current_time
+                center_x = (p_box[0] + p_box[2]) / 2
+                center_y = (p_box[1] + p_box[3]) / 2
 
-                    if is_new_for_stats:
-                        bbox_str = (
-                            f"x={int(p_box[0])},"
-                            f"y={int(p_box[1])},"
-                            f"w={int(p_box[2] - p_box[0])},"
-                            f"h={int(p_box[3] - p_box[1])}"
-                        )
+                event = {
+                    'timestamp': timestamp_str,
+                    'frame': frame_number,
+                    'source': source_name,
+                    'track_id': track_id,
+                    'person_count': len(persons),
+                    'missing_items': ", ".join(stable_missing),
+                    'confidence': person_conf,
+                    'bbox': bbox_str,
+                    'center_x': center_x,
+                    'center_y': center_y,
+                    'missing_list': stable_missing,
+                    'bbox_raw': p_box
+                }
 
-                        event = {
-                            'timestamp': timestamp_str,
-                            'frame': frame_number,
-                            'source': source_name,
-                            'track_id': track_id,
-                            'person_count': len(persons),
-                            'missing_items': ", ".join(stable_missing),
-                            'confidence': person_conf,
-                            'bbox': bbox_str,
-                            'center_x': center_x,
-                            'center_y': center_y,
-                            'missing_list': stable_missing
-                        }
+                new_event_data.append(event)
+                self.violation_log.append(event)
+                stable_violations_output.append((track_id, stable_missing, p_box))
 
-                        new_event_data.append(event)
-                        self.violation_log.append(event)
+                # 記錄違規坐標（用於熱力圖）
+                self.violation_coords.append((center_x, center_y))
 
-        self.violation_buffer.append(len(stable_violations) > 0)
-        is_stable_violation = sum(self.violation_buffer) >= 3
+                # 在畫面上標示
+                cv2.putText(
+                    annotated_frame,
+                    f"ID:{track_id} MISSING: {', '.join(stable_missing)}",
+                    (int(p_box[0]), int(p_box[1]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2
+                )
 
+        # === 第三階段：回傳結果 ===
+        # violation_detected: 只要有穩定違規就為 True（用於 UI 顯示紅框等）
+        # new_events: 只有通過 cooldown 檢查的事件（用於 EventLogger）
         all_missing = [
             item
-            for _, missing_items, _ in stable_violations
+            for _, missing_items, _ in stable_violations_output
             for item in missing_items
         ]
 
         return annotated_frame, {
             'person_count': len(persons),
-            'violation_detected': is_stable_violation,
-            'missing_items': list(set(all_missing)) if is_stable_violation else [],
-            'stable_violations': stable_violations if is_stable_violation else [],
-            'new_events': new_event_data if is_stable_violation else []
+            'violation_detected': len(frame_violations) > 0,
+            'missing_items': list(set(all_missing)),
+            'stable_violations': stable_violations_output,
+            'new_events': new_event_data  # 直接回傳，不被全域 buffer 過濾
         }
 
     def generate_heatmap(self, shape):
@@ -374,12 +471,154 @@ class HelmetDetector:
         return True
 
     def reset_tracking(self):
+        """重置所有追蹤狀態"""
         self.counted_violations = {}
         self.person_states = {}
         self.violation_coords.clear()
-        self.violation_buffer.clear()
+        if hasattr(self, 'violation_buffer'):
+            self.violation_buffer.clear()
         self.person_buffers.clear()
         self.violation_log.clear()
 
     def reset(self):
+        """完全重置（含配置）"""
         self.reset_tracking()
+
+    def _detect_demo(self, frame, target_items, source_name="unknown", frame_number=0):
+        """
+        Demo Mode 偵測：使用模擬 PPE 缺失資料。
+        
+        當沒有真實 PPE 模型時，用 person bbox 模擬 PPE 缺失，
+        用於展示完整流程（事件、截圖、報告等）。
+        """
+        import random
+        
+        current_time = time.time()
+        timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 建立一個黑色畫布作為 annotated_frame
+        h, w = frame.shape[:2]
+        annotated_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # 模擬 1-3 個人員
+        num_persons = random.randint(1, 3)
+        persons = []
+        
+        for i in range(num_persons):
+            # 隨機產生人員 bbox
+            x1 = random.randint(50, w - 200)
+            y1 = random.randint(50, h - 300)
+            bw = random.randint(80, 150)
+            bh = random.randint(200, 350)
+            x2, y2 = x1 + bw, y1 + bh
+            
+            p_box = [x1, y1, x2, y2]
+            track_id = f"demo_{i}"
+            person_conf = random.uniform(0.7, 0.95)
+            
+            persons.append((p_box, track_id, person_conf))
+            
+            # 在畫面上繪製人員框
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                annotated_frame,
+                f"Person ID:{track_id}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1
+            )
+        
+        # 對每個人員模擬 PPE 缺失
+        new_event_data = []
+        stable_violations_output = []
+        
+        for p_box, track_id, person_conf in persons:
+            # Demo Mode: 模擬固定的缺失模式
+            person_missing = list(self.demo_missing_pattern)
+            
+            # 更新人員狀態
+            self.person_states[track_id] = {
+                "last_seen": current_time,
+                "missing_items": set(person_missing),
+                "bbox": p_box,
+                "confidence": person_conf
+            }
+            
+            # 更新 temporal buffer
+            if track_id not in self.person_buffers:
+                self.person_buffers[track_id] = deque(maxlen=self.temporal_frames)
+            self.person_buffers[track_id].append(frozenset(person_missing))
+            
+            # 判斷是否為穩定違規（Demo Mode 下總是穩定）
+            if len(self.person_buffers[track_id]) >= self.temporal_frames:
+                stable_missing = person_missing
+                
+                # 檢查 cooldown
+                should_report, cooldown_keys = self._should_report_event(
+                    track_id, stable_missing, current_time
+                )
+                
+                if should_report:
+                    # 寫入 cooldown
+                    for key in cooldown_keys:
+                        self.counted_violations[key] = current_time
+                    
+                    # 產生事件資料
+                    bbox_str = (
+                        f"x={int(p_box[0])},"
+                        f"y={int(p_box[1])},"
+                        f"w={int(p_box[2] - p_box[0])},"
+                        f"h={int(p_box[3] - p_box[1])}"
+                    )
+                    
+                    center_x = (p_box[0] + p_box[2]) / 2
+                    center_y = (p_box[1] + p_box[3]) / 2
+                    
+                    event = {
+                        'timestamp': timestamp_str,
+                        'frame': frame_number,
+                        'source': source_name,
+                        'track_id': track_id,
+                        'person_count': len(persons),
+                        'missing_items': ", ".join(stable_missing),
+                        'confidence': person_conf,
+                        'bbox': bbox_str,
+                        'center_x': center_x,
+                        'center_y': center_y,
+                        'missing_list': stable_missing,
+                        'bbox_raw': p_box,
+                        'is_demo': True
+                    }
+                    
+                    new_event_data.append(event)
+                    self.violation_log.append(event)
+                    stable_violations_output.append((track_id, stable_missing, p_box))
+                    self.violation_coords.append((center_x, center_y))
+                    
+                    # 在畫面上標示違規
+                    cv2.putText(
+                        annotated_frame,
+                        f"MISSING: {', '.join(stable_missing)}",
+                        (int(p_box[0]), int(p_box[3]) + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 255),
+                        2
+                    )
+        
+        all_missing = [
+            item
+            for _, missing_items, _ in stable_violations_output
+            for item in missing_items
+        ]
+        
+        return annotated_frame, {
+            'person_count': len(persons),
+            'violation_detected': len(stable_violations_output) > 0,
+            'missing_items': list(set(all_missing)),
+            'stable_violations': stable_violations_output,
+            'new_events': new_event_data,
+            'is_demo': True
+        }

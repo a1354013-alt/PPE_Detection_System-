@@ -1,23 +1,40 @@
 """
 測試模組：PPE Detection System
 包含基本邏輯驗證測試
+
+注意：Unit test 不可以真的下載或載入 YOLO 模型
+使用 mock / fake model 避免依賴外部模型
 """
 
 import unittest
 import sys
 import os
+from unittest.mock import Mock, patch, MagicMock
 
 # 添加父目錄到 path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helmet_detector import HelmetDetector
+
+def create_mock_detector():
+    """建立一個 mock 的 HelmetDetector，不載入真實模型"""
+    # 先 patch ultralytics.YOLO 避免載入真實模型
+    with patch('ultralytics.YOLO') as mock_yolo:
+        from helmet_detector import HelmetDetector
+        
+        mock_model = Mock()
+        mock_model.names = {0: 'person'}
+        mock_yolo.return_value = mock_model
+        
+        detector = HelmetDetector(demo_mode=True)
+        detector.model = None  # 確保不使用真實模型
+        return detector
 
 
 class TestOverlap(unittest.TestCase):
     """測試空間重疊判定"""
     
     def setUp(self):
-        self.detector = HelmetDetector()
+        self.detector = create_mock_detector()
     
     def test_item_in_zone(self):
         """測試物品在區域內的情況"""
@@ -46,7 +63,7 @@ class TestZoneGeneration(unittest.TestCase):
     """測試人體區域劃分"""
     
     def setUp(self):
-        self.detector = HelmetDetector()
+        self.detector = create_mock_detector()
     
     def test_zone_boundaries(self):
         """測試區域邊界計算正確性"""
@@ -80,7 +97,7 @@ class TestTemporalBuffer(unittest.TestCase):
     """測試時間平滑 buffer"""
     
     def setUp(self):
-        self.detector = HelmetDetector()
+        self.detector = create_mock_detector()
         self.detector.temporal_frames = 3
     
     def test_buffer_initialization(self):
@@ -95,24 +112,38 @@ class TestTemporalBuffer(unittest.TestCase):
 
 
 class TestModelLoading(unittest.TestCase):
-    """測試模型載入"""
+    """測試模型載入（使用 mock）"""
     
-    def test_default_model_load(self):
-        """測試預設模型載入"""
+    @patch('ultralytics.YOLO')
+    def test_default_model_load(self, mock_yolo):
+        """測試預設模型載入（mock）"""
+        from helmet_detector import HelmetDetector
+        
+        mock_model = Mock()
+        mock_model.names = {0: 'person'}
+        mock_yolo.return_value = mock_model
+        
         detector = HelmetDetector()
         self.assertIsNotNone(detector.model)
         self.assertEqual(detector.model_path, 'yolov8n.pt')
     
-    def test_model_classes(self):
-        """測試模型類別獲取"""
+    @patch('ultralytics.YOLO')
+    def test_model_classes(self, mock_yolo):
+        """測試模型類別獲取（mock）"""
+        from helmet_detector import HelmetDetector
+        
+        mock_model = Mock()
+        mock_model.names = {0: 'person', 1: 'hardhat'}
+        mock_yolo.return_value = mock_model
+        
         detector = HelmetDetector()
         classes = detector.get_model_classes()
-        # yolov8n.pt 有 COCO 類別，包含 'person'
+        # 應該包含 person
         self.assertIn('person', classes)
     
     def test_config_loading(self):
         """測試配置文件載入"""
-        detector = HelmetDetector(config_path='config.json')
+        detector = create_mock_detector()
         self.assertIn('confidence_threshold', detector.config)
         self.assertIn('iou_threshold', detector.config)
 
@@ -121,15 +152,16 @@ class TestViolationLogging(unittest.TestCase):
     """測試違規記錄"""
     
     def setUp(self):
-        self.detector = HelmetDetector()
+        self.detector = create_mock_detector()
     
     def test_violation_log_structure(self):
         """測試違規記錄結構"""
         self.detector.violation_log.append({
             'frame': 1,
-            'person_id': 0,
+            'track_id': 'demo_0',
             'missing_items': ['helmet'],
-            'coords': (50.0, 50.0)
+            'center_x': 50.0,
+            'center_y': 50.0
         })
         self.assertEqual(len(self.detector.violation_log), 1)
         self.assertEqual(self.detector.violation_log[0]['frame'], 1)
@@ -139,6 +171,84 @@ class TestViolationLogging(unittest.TestCase):
         self.detector.violation_log.append({'frame': 1})
         self.detector.reset()
         self.assertEqual(len(self.detector.violation_log), 0)
+
+
+class TestDemoMode(unittest.TestCase):
+    """測試 Demo Mode"""
+    
+    def setUp(self):
+        self.detector = create_mock_detector()
+        self.detector.demo_mode = True
+    
+    def test_demo_mode_creates_events(self):
+        """測試 Demo Mode 能產生事件"""
+        import numpy as np
+        frame = np.zeros((500, 800, 3), dtype=np.uint8)
+        target_items = ['helmet', 'vest']
+        
+        # 需要多幀來滿足 temporal smoothing
+        for i in range(5):
+            result_frame, info = self.detector.detect(
+                frame, target_items, source_name="test", frame_number=i
+            )
+        
+        # 應該有產生事件
+        self.assertIn('new_events', info)
+        self.assertIn('is_demo', info)
+        self.assertTrue(info['is_demo'])
+
+
+class TestCooldownLogic(unittest.TestCase):
+    """測試冷卻機制"""
+    
+    def setUp(self):
+        self.detector = create_mock_detector()
+        self.detector.violation_cooldown = 2.0
+    
+    def test_independent_track_ids(self):
+        """測試不同 track_id 獨立冷卻"""
+        import time
+        current_time = time.time()
+        
+        # Track 1 剛統計過
+        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        
+        # Track 2 應該仍可統計
+        should_report, keys = self.detector._should_report_event(
+            'track_2', ['helmet'], current_time
+        )
+        self.assertTrue(should_report)
+        self.assertEqual(len(keys), 1)
+    
+    def test_same_track_in_cooldown(self):
+        """測試同一 track_id 在冷卻期內不會重複報告"""
+        import time
+        current_time = time.time()
+        
+        # Track 1 剛統計過
+        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        
+        # 0.5 秒後（仍在冷卻期內）
+        should_report, keys = self.detector._should_report_event(
+            'track_1', ['helmet'], current_time + 0.5
+        )
+        self.assertFalse(should_report)
+        self.assertEqual(len(keys), 0)
+    
+    def test_cooldown_expired(self):
+        """測試冷卻期過後可以再次報告"""
+        import time
+        current_time = time.time()
+        
+        # Track 1 剛統計過
+        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        
+        # 3 秒後（超過冷卻期）
+        should_report, keys = self.detector._should_report_event(
+            'track_1', ['helmet'], current_time + 3.0
+        )
+        self.assertTrue(should_report)
+        self.assertEqual(len(keys), 1)
 
 
 if __name__ == '__main__':
