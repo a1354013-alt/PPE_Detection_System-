@@ -5,7 +5,7 @@
 ## 核心功能
 
 - **即時 PPE 偵測**：支援安全帽、背心、護目鏡、口罩等多種裝備。
-- **人員追蹤 (Tracking)**：整合 YOLOv8 官方 Tracking 機制，並實作基於空間位置的 Fallback ID，確保以「人員」為單位進行精確統計。
+- **人員追蹤 (Tracking)**：整合 YOLOv8 官方 Tracking 機制 (`model.track(frame, persist=True)`)，並實作基於空間位置的 Fallback ID，確保以「人員」為單位進行精確統計。
 - **違規事件列表**：即時顯示違規時間、人員 ID、缺失項目及信心分數。
 - **自動截圖存證**：偵測到違規時自動儲存現場畫面。
 - **多格式報告匯出**：支援匯出 CSV、Excel 及 PDF 格式的完整違規報告。
@@ -48,9 +48,13 @@ pip install -r requirements.txt
 
 ### 穩定性過濾 (Temporal Smoothing)
 - 使用 **person-based buffer**，每個人獨立追蹤。
-- 簡化版 index tracking：以 person index 作為簡易 ID。
 - 需連續 N 幀（預設 3 幀，允許 1 幀誤差）出現相同缺失才判定為違規。
-- ⚠️ **注意**：由於 YOLOv8 預設不帶 Tracking，此為簡化版本，多人交叉移動時可能產生誤判。
+
+### Tracking Mode
+- **Tracking Implementation**: YOLOv8 built-in tracking with `model.track(frame, persist=True)`
+- **Tracking ID Source**: Directly from `box.id` in tracking results
+- **Fallback Mechanism**: Coordinate-based ID generation when tracking unavailable
+- **Duplicate Prevention**: Track_id based cooldown prevents duplicate counting
 
 ### 畫面比例保護
 - 使用等比例縮放，禁止強制變形導致影像失真。
@@ -62,7 +66,7 @@ pip install -r requirements.txt
 - 系統會自動生成 `violations/violations.csv`，記錄：
   - timestamp: 時間戳記
   - frame: 幀數
-  - person_id: 人員編號（簡易 index）
+  - track_id: 人員追蹤編號（來自 YOLOv8 tracking）
   - missing_items: 缺失項目
   - center_x, center_y: 違規位置座標
 
@@ -72,13 +76,19 @@ pip install -r requirements.txt
 /workspace/
 ├── main_gui.py          # 主程式入口
 ├── helmet_detector.py   # PPE 偵測核心邏輯
+├── event_logger.py      # 事件記錄與報告匯出
 ├── config.json          # 配置文件
 ├── requirements.txt     # 依賴套件
 ├── README.md           # 說明文件
 ├── .gitignore          # Git 忽略檔案
 ├── tests/
 │   └── test_detector.py # 單元測試
-└── violations/         # 違規記錄輸出目錄（自動生成）
+├── reports/            # 報告輸出目錄（自動生成）
+│   ├── ppe_violation_YYYYMMDD_HHMMSS.csv
+│   ├── ppe_violation_YYYYMMDD_HHMMSS.xlsx
+│   └── ppe_violation_YYYYMMDD_HHMMSS.pdf
+└── violations/         # 違規截圖輸出目錄（自動生成）
+    └── v_YYYYMMDD_HHMMSS_track_id.jpg
 ```
 
 ## 🔧 配置文件 (config.json)
@@ -96,14 +106,8 @@ pip install -r requirements.txt
 - `iou_threshold`: NMS IoU 閾值
 - `temporal_frames`: 時間平滑幀數
 - `cooldown_seconds`: 違規截圖冷卻時間（秒）
+
 主要相依套件包括：`ultralytics`, `opencv-python`, `pillow`, `matplotlib`, `pandas`, `openpyxl`, `reportlab`。
-
-## 🚀 核心優化說明
-
-- **Thread-Safe UI**：採用 `queue.Queue` 與 `window.after` 機制，確保背景偵測執行緒不會干擾 Tkinter 主執行緒，解決畫面卡死問題。
-- **空間關聯判定**：裝備必須位於人體上方 30% 區域（頭部區）才判定為合格，避免背景誤報。
-- **穩定性過濾**：引入連續幀判定機制（5 幀中需有 3 幀違規），過濾掉單幀的偵測抖動。
-- **精細化冷卻機制**：以 `(track_id, violation_type)` 為單位的冷卻邏輯，並具備人員狀態自動清理功能（TTL 機制），避免同一人在短時間內重複計入統計。
 
 ## 📂 使用流程
 
@@ -142,7 +146,7 @@ pip install -r requirements.txt
   - A: 系統預設使用 CPU 推論。若有 NVIDIA GPU，請確保安裝了 CUDA 版本的 ultralytics。
 
 - **Q: 為什麼多人場景有時會誤判？**
-  - A: 由於使用簡化版 index tracking，當人員快速移動或交叉時可能產生短暫誤判。這是已知限制。
+  - A: 當人員快速移動或交叉時可能產生短暫誤判。系統已實作 tracking-based cooldown 機制來減少重複計數。
 
 ## 🧪 執行測試
 
@@ -150,7 +154,7 @@ pip install -r requirements.txt
 cd /workspace
 python -m pytest tests/test_detector.py -v
 # 或使用 unittest
-python -m unittest tests.test_detector
+python -m unittest discover -v
 ```
 
 ## 🚀 啟動系統
@@ -162,9 +166,7 @@ python main_gui.py
 ## ⚠️ 重要提醒
 
 1. **預設 yolov8n.pt 不是 PPE 模型**，必須使用自訂 PPE 模型才能進行有效偵測。
-2. **Temporal smoothing 為簡化版本**，使用 person index 而非真實 tracking ID。
+2. **Tracking 模式**：系統使用 YOLOv8 內建 tracking (`model.track(frame, persist=True)`)，並提供 fallback 機制。
 3. **Heatmap 為位置聚合**，僅供視覺化參考。
 4. 請務必閱讀並理解配置文件參數後再進行調整。
-  - A: 系統預設使用 CPU 推論。若有 NVIDIA GPU，請確保安裝了 `onnxruntime-gpu` 或 `torch` 的 CUDA 版本。
-- **Q: PDF 報告中文字顯示異常？**
-  - A: 目前 PDF 報告優先支援英文內容，若需完整支援中文，需額外配置中文字型檔。
+5. **PDF 報告中文字顯示異常？** 目前 PDF 報告優先支援英文內容，若需完整支援中文，需額外配置中文字型檔。
