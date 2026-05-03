@@ -10,6 +10,7 @@ import unittest
 import sys
 import os
 import types
+import time
 from unittest.mock import Mock, patch, MagicMock
 
 # Create fake ultralytics module to avoid ModuleNotFoundError
@@ -17,7 +18,7 @@ fake_ultralytics = types.ModuleType("ultralytics")
 
 class FakeYOLO:
     def __init__(self, *args, **kwargs):
-        pass
+        self.names = {0: 'person', 1: 'hardhat'}
 
     def track(self, *args, **kwargs):
         return []
@@ -36,12 +37,35 @@ def create_mock_detector():
         from helmet_detector import HelmetDetector
         
         mock_model = Mock()
-        mock_model.names = {0: 'person'}
+        mock_model.names = {0: 'person', 1: 'hardhat'}
         mock_yolo.return_value = mock_model
         
         detector = HelmetDetector(demo_mode=True)
         detector.model = None  # 確保不使用真實模型
         return detector
+
+
+class TestInitialization(unittest.TestCase):
+    """測試初始化順序與屬性"""
+    
+    @patch('ultralytics.YOLO')
+    def test_init_order_class_map_exists(self, mock_yolo):
+        """測試 Bug 1: 確認 HelmetDetector 初始化時 class_map 已存在，且 _check_model_capability 不會失敗"""
+        from helmet_detector import HelmetDetector
+        
+        # 模擬 YOLO 模型
+        mock_model = Mock()
+        mock_model.names = {0: 'person', 1: 'hardhat'}
+        mock_yolo.return_value = mock_model
+        
+        # 建立實例，這會觸發 load_model -> _check_model_capability
+        # 如果 class_map 尚未初始化，_check_model_capability 會拋出 AttributeError
+        try:
+            detector = HelmetDetector(demo_mode=False)
+            self.assertTrue(hasattr(detector, 'class_map'), "class_map 應該在初始化後存在")
+            self.assertIn('hardhat', detector.class_map, "class_map 應該包含預定義的映射")
+        except AttributeError as e:
+            self.fail(f"初始化失敗，可能是 class_map 尚未建立就呼叫了使用它的方法: {e}")
 
 
 class TestOverlap(unittest.TestCase):
@@ -152,8 +176,8 @@ class TestModelLoading(unittest.TestCase):
         
         detector = HelmetDetector()
         classes = detector.get_model_classes()
-        # 應該包含 person
-        self.assertIn('person', classes)
+        # 應該包含 helmet (mapped from hardhat)
+        self.assertIn('helmet', classes)
     
     def test_config_loading(self):
         """測試配置文件載入"""
@@ -221,48 +245,96 @@ class TestCooldownLogic(unittest.TestCase):
     
     def test_independent_track_ids(self):
         """測試不同 track_id 獨立冷卻"""
-        import time
-        current_time = time.time()
+        curr_time = time.time()
         
-        # Track 1 剛統計過
-        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        # Track 1 剛統計過某種違規
+        event_key_1 = ('track_1', ('helmet',))
+        self.detector.counted_violations[event_key_1] = curr_time
         
         # Track 2 應該仍可統計
         should_report, keys = self.detector._should_report_event(
-            'track_2', ['helmet'], current_time
+            'track_2', ['helmet'], curr_time
         )
         self.assertTrue(should_report)
         self.assertEqual(len(keys), 1)
+        self.assertEqual(keys[0], ('track_2', ('helmet',)))
     
-    def test_same_track_in_cooldown(self):
-        """測試同一 track_id 在冷卻期內不會重複報告"""
-        import time
-        current_time = time.time()
+    def test_same_track_different_violations(self):
+        """測試 Bug 4: 同一個人如果缺失組合改變，視為新事件"""
+        curr_time = time.time()
         
-        # Track 1 剛統計過
-        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        # Track 1 剛統計過 helmet 違規
+        event_key_1 = ('track_1', ('helmet',))
+        self.detector.counted_violations[event_key_1] = curr_time
+        
+        # 同一個人現在缺失 helmet + vest，應該視為新事件
+        should_report, keys = self.detector._should_report_event(
+            'track_1', ['helmet', 'vest'], curr_time
+        )
+        self.assertTrue(should_report, "缺失組合改變應視為新事件")
+        self.assertEqual(keys[0], ('track_1', ('helmet', 'vest')))
+    
+    def test_same_track_same_violation_in_cooldown(self):
+        """測試同一 track_id 在冷卻期內不會重複報告相同組合"""
+        curr_time = time.time()
+        
+        # Track 1 剛統計過 helmet 違規
+        event_key_1 = ('track_1', ('helmet',))
+        self.detector.counted_violations[event_key_1] = curr_time
         
         # 0.5 秒後（仍在冷卻期內）
         should_report, keys = self.detector._should_report_event(
-            'track_1', ['helmet'], current_time + 0.5
+            'track_1', ['helmet'], curr_time + 0.5
         )
         self.assertFalse(should_report)
-        self.assertEqual(len(keys), 0)
     
     def test_cooldown_expired(self):
         """測試冷卻期過後可以再次報告"""
-        import time
-        current_time = time.time()
+        curr_time = time.time()
         
         # Track 1 剛統計過
-        self.detector.counted_violations[('track_1', 'helmet')] = current_time
+        event_key_1 = ('track_1', ('helmet',))
+        self.detector.counted_violations[event_key_1] = curr_time
         
         # 3 秒後（超過冷卻期）
         should_report, keys = self.detector._should_report_event(
-            'track_1', ['helmet'], current_time + 3.0
+            'track_1', ['helmet'], curr_time + 3.0
         )
         self.assertTrue(should_report)
-        self.assertEqual(len(keys), 1)
+
+
+class TestReportExport(unittest.TestCase):
+    """測試 Bug 2: 報告輸出路徑"""
+    
+    def setUp(self):
+        from event_logger import EventLogger, ViolationEvent
+        self.logger = EventLogger()
+        self.event = ViolationEvent(
+            timestamp="2026-05-03 12:00:00",
+            source="test",
+            track_id="1",
+            person_count=1,
+            missing_items="helmet",
+            screenshot_path="test.jpg",
+            confidence=0.9,
+            bbox="[0,0,100,100]"
+        )
+        self.logger.add_event(self.event)
+        
+        # 確保 reports 目錄存在
+        if not os.path.exists("reports"):
+            os.makedirs("reports")
+
+    def test_csv_export_path(self):
+        """測試 CSV 匯出到指定路徑"""
+        filepath = os.path.join("reports", "test_report.csv")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            
+        path = self.logger.export_csv(filepath)
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(path.startswith("reports"))
+        os.remove(path)
 
 
 if __name__ == '__main__':

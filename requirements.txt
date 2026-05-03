@@ -6,3 +6,4 @@ numpy
 openpyxl
 reportlab
 pandas
+pytest

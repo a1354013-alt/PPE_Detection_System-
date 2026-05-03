@@ -43,12 +43,6 @@ class HelmetDetector:
         os.makedirs("reports", exist_ok=True)
         os.makedirs("violations", exist_ok=True)
 
-        # 載入模型（如果是 demo mode 且無模型，會稍後處理）
-        if not demo_mode or model_path and os.path.exists(model_path):
-            self.load_model(model_path)
-        else:
-            self.model = None
-        
         # 類別映射：將模型輸出的標籤映射到系統標準標籤
         self.class_map = {
             'hardhat': 'helmet',
@@ -63,6 +57,12 @@ class HelmetDetector:
             'mask': 'mask',
             'face_mask': 'mask'
         }
+
+        # 載入模型（如果是 demo mode 且無模型，會稍後處理）
+        if not demo_mode or model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+        else:
+            self.model = None
 
         # === 人員追蹤狀態（每個 track_id 獨立）===
         self.person_states = {}  # track_id -> {last_seen, missing_items, bbox, confidence}
@@ -285,30 +285,25 @@ class HelmetDetector:
         判斷是否應該報告新事件。
         
         規則：
-        1. 每個 (track_id, violation_type) 組合獨立 cooldown
-        2. 只有真正回傳給 UI 的事件才寫入 cooldown
-        3. 使用 event_key = (track_id, tuple(sorted(missing_items))) 確保唯一性
+        1. 使用 event_key = (track_id, tuple(sorted(stable_missing))) 做組合型違規事件 cooldown
+        2. 同一個人在同一組缺失裝備 cooldown 內不重複記錄
+        3. 同一個人如果缺失組合改變，視為新事件
+        4. 不同 track_id 不互相影響
         
         回傳：(should_report, updated_cooldown_keys)
         """
         if not stable_missing:
             return False, []
         
-        cooldown_keys = []
-        should_report = False
-        
         # 建立唯一 event key，確保每種 missing_items 組合獨立冷卻
         event_key = (track_id, tuple(sorted(stable_missing)))
         
-        for violation_type in stable_missing:
-            key = (track_id, violation_type)
-            last_count_time = self.counted_violations.get(key, 0)
-            
-            if current_time - last_count_time >= self.violation_cooldown:
-                cooldown_keys.append(key)
-                should_report = True
+        last_count_time = self.counted_violations.get(event_key, 0)
         
-        return should_report, cooldown_keys
+        if current_time - last_count_time >= self.violation_cooldown:
+            return True, [event_key]
+        
+        return False, []
 
     def detect(self, frame, target_items, source_name="unknown", frame_number=0):
         """
