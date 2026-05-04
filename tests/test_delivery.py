@@ -1,73 +1,81 @@
-import unittest
 import os
 import sys
-import shutil
-from scripts.verify_delivery import check_ignore_rules, check_requirements, check_forbidden_artifacts
+import unittest
+
+from scripts import verify_delivery
+
 
 class TestDeliveryScript(unittest.TestCase):
     def setUp(self):
-        # Change to project root if needed
         self.root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.original_cwd = os.getcwd()
         os.chdir(self.root_dir)
 
-    def test_import_verify_delivery(self):
-        """驗證 verify_delivery.py 可以被 import"""
-        try:
-            import scripts.verify_delivery
-            self.assertTrue(True)
-        except ImportError:
-            self.fail("Failed to import scripts.verify_delivery")
+    def tearDown(self):
+        os.chdir(self.original_cwd)
 
-    def test_ignore_rule_checker_detects_missing(self):
-        """驗證 ignore rule checker 可以偵測缺少規則"""
-        # Backup gitignore
-        with open(".gitignore", "r") as f:
-            original_content = f.read()
-        
-        try:
-            # Create a temporary gitignore without reports/
-            with open(".gitignore", "w") as f:
-                f.write("*.pyc\n")
-            
-            # Should return False because reports/ is missing
-            self.assertFalse(check_ignore_rules())
-        finally:
-            # Restore gitignore
-            with open(".gitignore", "w") as f:
-                f.write(original_content)
+    def test_build_python_command_uses_current_interpreter(self):
+        command = verify_delivery.build_python_command("-m", "compileall", "-q", ".")
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[1:], ["-m", "compileall", "-q", "."])
 
-    def test_requirements_checker_detects_missing(self):
-        """驗證 requirements checker 可以偵測缺少必要套件"""
-        # Backup requirements.txt
-        with open("requirements.txt", "r") as f:
-            original_content = f.read()
-        
+    def test_gitignore_contains_required_rules(self):
+        with open(".gitignore", "r", encoding="utf-8") as file_obj:
+            content = file_obj.read()
+
+        required_rules = [
+            "reports/",
+            "violations/",
+            "*.mp4",
+            "*.avi",
+            "*.mov",
+            "*.mkv",
+            "*.pt",
+            "*.pth",
+            "*.onnx",
+            "*.engine",
+            "*.weights",
+        ]
+
+        for rule in required_rules:
+            self.assertIn(rule, content)
+
+        self.assertNotIn("```", content)
+
+    def test_check_ignore_rules_detects_missing_rule(self):
+        with open(".gitignore", "r", encoding="utf-8") as file_obj:
+            original_content = file_obj.read()
+
         try:
-            # Create a temporary requirements.txt without reportlab
-            with open("requirements.txt", "w") as f:
-                f.write("numpy\npandas\n")
-            
-            # Should return False because reportlab is missing
-            self.assertFalse(check_requirements())
+            with open(".gitignore", "w", encoding="utf-8") as file_obj:
+                file_obj.write("__pycache__/\n")
+            self.assertFalse(verify_delivery.check_ignore_rules())
         finally:
-            # Restore requirements.txt
-            with open("requirements.txt", "w") as f:
-                f.write(original_content)
+            with open(".gitignore", "w", encoding="utf-8") as file_obj:
+                file_obj.write(original_content)
+
+    def test_requirements_checker_detects_missing_package(self):
+        with open("requirements.txt", "r", encoding="utf-8") as file_obj:
+            original_content = file_obj.read()
+
+        try:
+            with open("requirements.txt", "w", encoding="utf-8") as file_obj:
+                file_obj.write("numpy\npandas\n")
+            self.assertFalse(verify_delivery.check_requirements())
+        finally:
+            with open("requirements.txt", "w", encoding="utf-8") as file_obj:
+                file_obj.write(original_content)
 
     def test_forbidden_artifact_checker_detects_files(self):
-        """驗證 forbidden artifact checker 可以偵測大型模型檔"""
-        test_file = "temp_test_model.pt"
+        temp_model = "temp_test_model.pt"
         try:
-            # Create a dummy .pt file
-            with open(test_file, "w") as f:
-                f.write("dummy")
-            
-            # Should return False because .pt file is found
-            self.assertFalse(check_forbidden_artifacts())
+            with open(temp_model, "w", encoding="utf-8") as file_obj:
+                file_obj.write("dummy")
+            self.assertFalse(verify_delivery.check_forbidden_artifacts())
         finally:
-            # Cleanup
-            if os.path.exists(test_file):
-                os.remove(test_file)
+            if os.path.exists(temp_model):
+                os.remove(temp_model)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

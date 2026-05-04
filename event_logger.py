@@ -27,6 +27,14 @@ class EventLogger:
     def __init__(self):
         self.events: List[ViolationEvent] = []
 
+    @staticmethod
+    def _normalize_processing_summary(processing_summary):
+        if not processing_summary:
+            return {}
+        if isinstance(processing_summary, dict):
+            return processing_summary
+        return {"summary_text": str(processing_summary)}
+
     def add_event(self, event: ViolationEvent):
         self.events.append(event)
 
@@ -44,8 +52,9 @@ class EventLogger:
         df.to_csv(filepath, index=False, encoding='utf-8-sig')
         return filepath
 
-    def export_excel(self, filepath: str, stats: dict):
+    def export_excel(self, filepath: str, stats: dict, processing_summary=None):
         df = self.to_dataframe()
+        processing_summary = self._normalize_processing_summary(processing_summary)
         wb = Workbook()
         
         # Sheet 1: 事件明細
@@ -73,14 +82,22 @@ class EventLogger:
         ws2.append(["Total Violation Events", len(self.events)])
         for item, count in stats.get("missing_counts", {}).items():
             ws2.append([f"{item.capitalize()} Violations", count])
+
+        if processing_summary:
+            ws2.append([])
+            ws2.append(["Processing Summary", "Value"])
+            for key, value in processing_summary.items():
+                label = str(key).replace("_", " ").title()
+                ws2.append([label, value])
         
         wb.save(filepath)
         return filepath
 
-    def export_pdf(self, filepath: str, stats: dict):
+    def export_pdf(self, filepath: str, stats: dict, processing_summary=None):
         doc = SimpleDocTemplate(filepath, pagesize=A4)
         styles = getSampleStyleSheet()
         elements = []
+        processing_summary = self._normalize_processing_summary(processing_summary)
 
         # 標題
         elements.append(Paragraph("PPE Violation Report", styles['Title']))
@@ -108,6 +125,24 @@ class EventLogger:
         elements.append(Paragraph("Summary Statistics", styles['Heading2']))
         elements.append(summary_table)
         elements.append(Spacer(1, 24))
+
+        if processing_summary:
+            processing_data = [["Field", "Value"]]
+            for key, value in processing_summary.items():
+                processing_data.append([str(key).replace("_", " ").title(), str(value)])
+
+            processing_table = Table(processing_data, colWidths=[180, 280])
+            processing_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.darkblue),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
+            ]))
+            elements.append(Paragraph("Processing Summary", styles['Heading2']))
+            elements.append(processing_table)
+            elements.append(Spacer(1, 24))
 
         # 事件明細表格 (只取前 50 筆避免 PDF 過大)
         elements.append(Paragraph("Event Details (Top 50)", styles['Heading2']))
