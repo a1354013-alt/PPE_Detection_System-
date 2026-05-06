@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 from scripts import verify_delivery
 
@@ -67,14 +68,13 @@ class TestDeliveryScript(unittest.TestCase):
                 file_obj.write(original_content)
 
     def test_forbidden_artifact_checker_detects_files(self):
-        temp_model = "temp_test_model.pt"
-        try:
-            with open(temp_model, "w", encoding="utf-8") as file_obj:
-                file_obj.write("dummy")
+        fake_walk = [
+            (".", ["tests"], ["README.md", "temp_test_model.pt"]),
+            (os.path.join(".", "tests"), [], []),
+        ]
+
+        with patch("scripts.verify_delivery.os.walk", return_value=fake_walk):
             self.assertFalse(verify_delivery.check_forbidden_artifacts())
-        finally:
-            if os.path.exists(temp_model):
-                os.remove(temp_model)
 
 
 if __name__ == "__main__":

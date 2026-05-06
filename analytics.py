@@ -1,7 +1,8 @@
-import pandas as pd
 from datetime import datetime
-import os
-from typing import List, Dict, Any
+from typing import Any, Dict, List
+
+import pandas as pd
+
 from event_logger import ViolationEvent
 
 def parse_timestamp(ts: Any) -> datetime:

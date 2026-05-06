@@ -212,7 +212,8 @@ class HelmetDetectionApp:
     def show_demo_info(self):
         messagebox.showinfo(
             "Demo Mode",
-            "Demo Mode 會模擬事件列表、報告匯出與熱力圖流程，\n不代表真實模型推論結果。",
+            "Demo Mode 僅供展示系統流程與匯出功能。\n"
+            "其中事件與違規結果為模擬資料，不代表真實 PPE 模型推論。",
         )
 
     def update_model_info(self):
@@ -249,21 +250,30 @@ class HelmetDetectionApp:
             self.update_model_info()
             messagebox.showerror("Model", message)
 
+    def _get_enabled_target_items(self):
+        return [item for item, var in self.check_vars.items() if var.get()]
+
     def validate_model_support(self, show_message=True):
+        self.update_model_info()
         if self.demo_mode:
-            self.update_model_info()
             return True
 
-        model_classes = set(self.detector.get_model_classes())
-        unsupported = [item for item, var in self.check_vars.items() if var.get() and item not in model_classes]
+        if not self.detector.model_loaded:
+            if show_message:
+                messagebox.showerror(
+                    "Model Required",
+                    "Real Mode requires a loaded PPE model before detection can start.",
+                )
+            return False
 
-        self.update_model_info()
+        model_classes = set(self.detector.get_model_classes())
+        unsupported = [item for item in self._get_enabled_target_items() if item not in model_classes]
         if unsupported and show_message:
             messagebox.showwarning(
                 "Model Capability",
-                "目前模型不支援以下選取項目：\n"
+                "The loaded model does not support the selected PPE items:\n"
                 f"{', '.join(unsupported)}\n\n"
-                "若目前使用的是 yolov8n.pt / COCO 模型，請改載入 PPE 模型或使用 Demo Mode。",
+                "Please load a PPE-specific model or switch to Demo Mode.",
             )
         return not unsupported
 
@@ -337,28 +347,32 @@ class HelmetDetectionApp:
 
         messagebox.showwarning("Screenshot", "Screenshot file not found.")
 
+    def _build_report_filepath(self, fmt):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join("reports", f"ppe_violation_report_{timestamp}.{fmt}")
+
+    def _export_report_file(self, fmt, filepath, processing_summary):
+        if fmt == "csv":
+            return self.event_logger.export_csv(filepath)
+        if fmt == "xlsx":
+            return self.event_logger.export_excel(filepath, self.stats, processing_summary=processing_summary)
+        if fmt == "pdf":
+            return self.event_logger.export_pdf(filepath, self.stats, processing_summary=processing_summary)
+        raise ValueError("Unsupported export format.")
+
     def export_report(self, fmt):
         if not self.event_logger.events:
             messagebox.showwarning("Export", "No violation events available for export.")
             return
 
-        os.makedirs("reports", exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filepath = os.path.join("reports", f"ppe_violation_report_{timestamp}.{fmt}")
+        filepath = self._build_report_filepath(fmt)
         processing_summary = self.detector.get_processing_summary_data()
 
         try:
-            if fmt == "csv":
-                path = self.event_logger.export_csv(filepath)
-            elif fmt == "xlsx":
-                path = self.event_logger.export_excel(filepath, self.stats, processing_summary=processing_summary)
-            elif fmt == "pdf":
-                path = self.event_logger.export_pdf(filepath, self.stats, processing_summary=processing_summary)
-            else:
-                messagebox.showerror("Export", "Unsupported export format.")
-                return
-
+            path = self._export_report_file(fmt, filepath, processing_summary)
             messagebox.showinfo("Export", f"Report saved successfully:\n{os.path.abspath(path)}")
+        except ValueError as exc:
+            messagebox.showerror("Export", str(exc))
         except Exception as exc:
             messagebox.showerror("Export", f"Failed to export report:\n{exc}")
 
@@ -409,6 +423,10 @@ class HelmetDetectionApp:
         if self.running:
             return
 
+        if not self.demo_mode and not self.validate_model_support(show_message=True):
+            self.set_status("Detection blocked until a compatible PPE model is loaded.")
+            return
+
         self.reset_detection_state()
         self.enabled_items = {key: var.get() for key, var in self.check_vars.items()}
         self.vid = cv2.VideoCapture(source)
@@ -432,6 +450,7 @@ class HelmetDetectionApp:
     def detection_worker(self):
         last_capture_time_by_track = {}
         frame_number = 0
+        stop_payload = None
 
         while not self.stop_event.is_set():
             ret, frame = self.vid.read()
@@ -461,6 +480,14 @@ class HelmetDetectionApp:
                 frame_number=frame_number,
             )
             self.result_queue.put(("FRAME", annotated))
+
+            if info.get("error"):
+                stop_payload = {
+                    "reason": "error",
+                    "auto_report": False,
+                    "error": info["error"],
+                }
+                break
 
             if info.get("violation_detected"):
                 for event_data in info.get("new_events", []):
@@ -492,14 +519,36 @@ class HelmetDetectionApp:
             frame_number += 1
             time.sleep(0.01)
 
-        stop_reason = "manual_stop" if self.stop_event.is_set() else "natural_end"
-        self.result_queue.put(("STOP", {"reason": stop_reason, "auto_report": True}))
+        if stop_payload is None:
+            stop_reason = "manual_stop" if self.stop_event.is_set() else "natural_end"
+            stop_payload = {"reason": stop_reason, "auto_report": True}
+
+        self.result_queue.put(("STOP", stop_payload))
 
     def handle_stop(self, stop_data=None):
         stop_data = stop_data or {"reason": "natural_end", "auto_report": True}
-        self.finalize_detection(auto_report=stop_data.get("auto_report", True), reason=stop_data.get("reason", "natural_end"))
+        self.finalize_detection(
+            auto_report=stop_data.get("auto_report", True),
+            reason=stop_data.get("reason", "natural_end"),
+            error_message=stop_data.get("error", ""),
+        )
 
-    def finalize_detection(self, auto_report=True, reason="manual_stop", notify=True):
+    def _collect_finalize_artifacts(self, auto_report):
+        violations_path = None
+        heatmap_path = None
+
+        if auto_report:
+            if self.detector.save_violation_log():
+                violations_path = os.path.abspath("violations/violations.csv")
+
+            if self.detector.violation_coords:
+                heatmap = self.detector.generate_heatmap((500, 800, 3))
+                heatmap_path = os.path.abspath(os.path.join("reports", "violation_heatmap.jpg"))
+                cv2.imwrite(heatmap_path, heatmap)
+
+        return violations_path, heatmap_path
+
+    def finalize_detection(self, auto_report=True, reason="manual_stop", notify=True, error_message=""):
         if self.finalize_completed:
             return self.last_finalize_result
 
@@ -517,22 +566,21 @@ class HelmetDetectionApp:
         self.btn_upload.config(state=tk.NORMAL)
         self.btn_camera.config(state=tk.NORMAL)
 
-        violations_path = None
-        heatmap_path = None
-        if auto_report:
-            if self.detector.save_violation_log():
-                violations_path = os.path.abspath("violations/violations.csv")
-
-            if self.detector.violation_coords:
-                heatmap = self.detector.generate_heatmap((500, 800, 3))
-                heatmap_path = os.path.abspath(os.path.join("reports", "violation_heatmap.jpg"))
-                cv2.imwrite(heatmap_path, heatmap)
-
+        violations_path, heatmap_path = self._collect_finalize_artifacts(auto_report)
         summary = self.detector.get_processing_summary_data()
-        status_message = "Detection stopped." if reason == "manual_stop" else "Detection completed."
+
+        if reason == "error":
+            status_message = "Detection stopped due to model/runtime error."
+        elif reason == "manual_stop":
+            status_message = "Detection stopped."
+        else:
+            status_message = "Detection completed."
+
         self.set_status(f"{status_message} Source: {summary['source_name']} | Violations: {summary['total_violations']}")
 
         message_lines = [status_message, f"Source: {summary['source_name']}", f"Total violations: {summary['total_violations']}"]
+        if error_message:
+            message_lines.append(f"Error: {error_message}")
         if violations_path:
             message_lines.append(f"Violation log: {violations_path}")
         if heatmap_path:
@@ -547,10 +595,14 @@ class HelmetDetectionApp:
             "summary": summary,
             "violations_path": violations_path,
             "heatmap_path": heatmap_path,
+            "error": error_message,
         }
 
         if notify:
-            messagebox.showinfo("Detection Finished", "\n".join(message_lines))
+            if error_message:
+                messagebox.showerror("Detection Error", "\n".join(message_lines))
+            else:
+                messagebox.showinfo("Detection Finished", "\n".join(message_lines))
 
         return self.last_finalize_result
 

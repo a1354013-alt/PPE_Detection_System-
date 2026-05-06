@@ -1,9 +1,12 @@
 import os
+import random
 import sys
 import time
 import types
 import unittest
 from unittest.mock import Mock, patch
+
+import numpy as np
 
 
 fake_ultralytics = types.ModuleType("ultralytics")
@@ -22,7 +25,7 @@ sys.modules["ultralytics"] = fake_ultralytics
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helmet_detector import HelmetDetector
+from helmet_detector import HelmetDetector, MODEL_NOT_LOADED_ERROR
 
 
 def create_detector(demo_mode=False):
@@ -49,6 +52,16 @@ class TestInitialization(unittest.TestCase):
         detector = HelmetDetector()
         self.assertFalse(detector.model_loaded)
         self.assertIn("Failed to load model", detector.model_status_message)
+
+    def test_demo_rng_does_not_pollute_global_random(self):
+        random.seed(99)
+        expected = random.random()
+
+        random.seed(99)
+        create_detector(demo_mode=True)
+        actual = random.random()
+
+        self.assertEqual(actual, expected)
 
 
 class TestProcessingSummary(unittest.TestCase):
@@ -85,6 +98,41 @@ class TestCooldownLogic(unittest.TestCase):
 
         should_report, _ = self.detector._should_report_event("track_1", ["helmet"], current_time + 0.5)
         self.assertFalse(should_report)
+
+
+class TestDetectionBoundaries(unittest.TestCase):
+    def test_real_mode_without_model_returns_error_and_skips_demo(self):
+        detector = create_detector(demo_mode=False)
+        detector.model = None
+        detector.model_loaded = False
+        detector._detect_demo = Mock(side_effect=AssertionError("demo should not run"))
+        frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+        annotated, info = detector.detect(frame, ["helmet"], source_name="source", frame_number=1)
+
+        detector._detect_demo.assert_not_called()
+        self.assertIs(annotated, frame)
+        self.assertFalse(info["violation_detected"])
+        self.assertEqual(info["new_events"], [])
+        self.assertEqual(info["stable_violations"], [])
+        self.assertEqual(info["error"], MODEL_NOT_LOADED_ERROR)
+
+    def test_demo_mode_only_emits_selected_target_items(self):
+        detector = create_detector(demo_mode=True)
+        detector.temporal_frames = 1
+        detector.violation_cooldown = 0
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        _, info = detector.detect(frame, ["helmet"], source_name="demo", frame_number=1)
+
+        self.assertTrue(set(info["missing_items"]).issubset({"helmet"}))
+        for _, missing_items, _ in info["stable_violations"]:
+            self.assertTrue(set(missing_items).issubset({"helmet"}))
+        for event in info["new_events"]:
+            self.assertTrue(set(event["missing_list"]).issubset({"helmet"}))
+            self.assertNotIn("vest", event["missing_items"])
+            self.assertNotIn("mask", event["missing_items"])
+            self.assertNotIn("goggles", event["missing_items"])
 
 
 if __name__ == "__main__":

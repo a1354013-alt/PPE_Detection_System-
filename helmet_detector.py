@@ -11,7 +11,7 @@ import numpy as np
 
 
 DEMO_RANDOM_SEED = 42
-random.seed(DEMO_RANDOM_SEED)
+MODEL_NOT_LOADED_ERROR = "Model is not loaded. Please load a PPE model or enable Demo Mode."
 
 
 class HelmetDetector:
@@ -33,6 +33,7 @@ class HelmetDetector:
         self.iou = self.config.get("iou_threshold", iou)
         self.temporal_frames = self.config.get("temporal_frames", 3)
         self.cooldown_seconds = self.config.get("cooldown_seconds", 2)
+        self.demo_rng = random.Random(DEMO_RANDOM_SEED)
 
         os.makedirs("reports", exist_ok=True)
         os.makedirs("violations", exist_ok=True)
@@ -79,6 +80,18 @@ class HelmetDetector:
             "goggles": False,
             "supported_items": [],
             "is_ppe_model": False,
+        }
+
+    def _build_empty_detection_info(self, fps=0, error=""):
+        return {
+            "person_count": 0,
+            "violation_detected": False,
+            "missing_items": [],
+            "stable_violations": [],
+            "new_events": [],
+            "fps": fps,
+            "is_demo": False,
+            "error": error,
         }
 
     def load_config(self, config_path):
@@ -272,22 +285,18 @@ class HelmetDetector:
         return False, []
 
     def detect(self, frame, target_items, source_name="unknown", frame_number=0):
-        if self.demo_mode or self.model is None:
+        if self.demo_mode:
             return self._detect_demo(frame, target_items, source_name, frame_number)
+
+        if self.model is None:
+            return frame, self._build_empty_detection_info(error=MODEL_NOT_LOADED_ERROR)
 
         current_time = time.time()
         self.cleanup_stale_tracks(current_time)
 
         results, is_tracking = self.run_detection_with_tracking(frame)
         if not results:
-            return frame, {
-                "person_count": 0,
-                "violation_detected": False,
-                "missing_items": [],
-                "stable_violations": [],
-                "new_events": [],
-                "fps": 0,
-            }
+            return frame, self._build_empty_detection_info()
 
         result = results[0]
         names = result.names
@@ -406,6 +415,8 @@ class HelmetDetector:
             "stable_violations": stable_violations_output,
             "new_events": new_event_data,
             "fps": fps,
+            "is_demo": False,
+            "error": "",
         }
 
     def generate_heatmap(self, shape):
@@ -465,6 +476,7 @@ class HelmetDetector:
         self.processing_start_time = None
         self.processing_end_time = None
         self.video_name = ""
+        self.demo_rng = random.Random(DEMO_RANDOM_SEED)
 
     def get_processing_summary_data(self):
         processing_time = 0
@@ -520,25 +532,46 @@ class HelmetDetector:
     def reset(self):
         self.reset_tracking()
 
+    def _build_demo_patterns(self, target_items):
+        target_set = {item for item in target_items if item in self.PPE_ITEMS}
+        base_patterns = [
+            ["helmet"],
+            ["vest"],
+            ["helmet", "vest"],
+            ["helmet", "mask"],
+            ["vest", "goggles"],
+        ]
+
+        filtered_patterns = []
+        for pattern in base_patterns:
+            filtered = [item for item in pattern if item in target_set]
+            if filtered not in filtered_patterns:
+                filtered_patterns.append(filtered)
+
+        if [] not in filtered_patterns:
+            filtered_patterns.append([])
+
+        return filtered_patterns
+
     def _detect_demo(self, frame, target_items, source_name="unknown", frame_number=0):
         current_time = time.time()
         timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         height, width = frame.shape[:2]
         annotated_frame = np.zeros((height, width, 3), dtype=np.uint8)
-        num_persons = random.randint(1, 3)
+        num_persons = self.demo_rng.randint(1, 3)
         persons = []
 
         for index in range(num_persons):
-            x1 = random.randint(50, max(60, width - 200))
-            y1 = random.randint(50, max(60, height - 300))
-            box_width = random.randint(80, 150)
-            box_height = random.randint(200, 350)
+            x1 = self.demo_rng.randint(50, max(60, width - 200))
+            y1 = self.demo_rng.randint(50, max(60, height - 300))
+            box_width = self.demo_rng.randint(80, 150)
+            box_height = self.demo_rng.randint(200, 350)
             x2, y2 = x1 + box_width, y1 + box_height
 
             p_box = [x1, y1, x2, y2]
             track_id = f"demo_{index}"
-            person_conf = random.uniform(0.7, 0.95)
+            person_conf = self.demo_rng.uniform(0.7, 0.95)
             persons.append((p_box, track_id, person_conf))
 
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -554,10 +587,13 @@ class HelmetDetector:
 
         new_event_data = []
         stable_violations_output = []
-        demo_patterns = [["helmet"], ["vest"], ["helmet", "vest"], ["helmet", "mask"], ["vest", "goggles"], []]
+        demo_patterns = self._build_demo_patterns(target_items)
 
         for p_box, track_id, person_conf in persons:
-            person_missing = random.choice(demo_patterns[:-1]) if random.random() < 0.8 else []
+            if self.demo_rng.random() < 0.8:
+                person_missing = list(self.demo_rng.choice(demo_patterns[:-1] or [[]]))
+            else:
+                person_missing = []
 
             self.person_states[track_id] = {
                 "last_seen": current_time,
@@ -573,7 +609,7 @@ class HelmetDetector:
             if len(self.person_buffers[track_id]) < self.temporal_frames:
                 continue
 
-            stable_missing = person_missing
+            stable_missing = [item for item in person_missing if item in target_items]
             should_report, cooldown_keys = self._should_report_event(track_id, stable_missing, current_time)
             if not should_report:
                 continue
@@ -636,4 +672,5 @@ class HelmetDetector:
             "new_events": new_event_data,
             "is_demo": True,
             "fps": fps,
+            "error": "",
         }

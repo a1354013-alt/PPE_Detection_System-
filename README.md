@@ -58,6 +58,7 @@ Demo Mode is for product demonstration and workflow verification only.
 - It can be used when you do not have a PPE model available.
 - It simulates event generation so you can demonstrate the event list, report export, and heatmap flow.
 - Demo Mode does not represent real inference results.
+- Real Mode will not silently fall back to Demo Mode; load a PPE model first if you need real detection.
 
 ## Generated Outputs
 
