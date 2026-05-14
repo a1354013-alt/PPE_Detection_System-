@@ -30,6 +30,7 @@ htmlcov/
 # Generated reports and screenshots
 reports/
 violations/
+outputs/
 
 # Videos
 *.mp4

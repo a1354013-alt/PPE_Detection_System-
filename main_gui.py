@@ -35,6 +35,14 @@ class HelmetDetectionApp:
         self.enabled_items = {}
         self.finalize_completed = False
         self.last_finalize_result = None
+        self.stop_requested = False
+
+        self.output_root = "outputs"
+        self.current_run_dir = None
+        self.current_screenshots_dir = None
+        self.current_reports_dir = None
+        self.current_violation_csv_path = None
+        self.current_heatmap_path = None
 
         self.stats = {
             "total_violations": 0,
@@ -46,8 +54,7 @@ class HelmetDetectionApp:
             },
         }
 
-        os.makedirs("reports", exist_ok=True)
-        os.makedirs("violations", exist_ok=True)
+        os.makedirs(self.output_root, exist_ok=True)
 
         self.setup_ui()
         self.update_model_info()
@@ -212,8 +219,8 @@ class HelmetDetectionApp:
     def show_demo_info(self):
         messagebox.showinfo(
             "Demo Mode",
-            "Demo Mode 僅供展示系統流程與匯出功能。\n"
-            "其中事件與違規結果為模擬資料，不代表真實 PPE 模型推論。",
+            "Demo Mode simulates PPE events for UI, report, and workflow demonstrations.\n"
+            "It does not represent real model accuracy.",
         )
 
     def update_model_info(self):
@@ -222,11 +229,10 @@ class HelmetDetectionApp:
         capability_lines = [
             f"Loaded: {'Yes' if snapshot['loaded'] else 'No'}",
             f"Model Path: {snapshot['path'] or 'N/A'}",
+            f"Contract Mode: {caps.get('contract_mode', 'unsupported')}",
             f"Supports person: {'Yes' if caps.get('person') else 'No'}",
-            f"Supports helmet: {'Yes' if caps.get('helmet') else 'No'}",
-            f"Supports vest: {'Yes' if caps.get('vest') else 'No'}",
-            f"Supports mask: {'Yes' if caps.get('mask') else 'No'}",
-            f"Supports goggles: {'Yes' if caps.get('goggles') else 'No'}",
+            f"Presence PPE: {', '.join(caps.get('presence_items', [])) or 'None'}",
+            f"Direct violations: {', '.join(caps.get('violation_items', [])) or 'None'}",
             f"Demo Mode: {'Yes' if snapshot['demo_mode'] else 'No'}",
         ]
 
@@ -258,24 +264,11 @@ class HelmetDetectionApp:
         if self.demo_mode:
             return True
 
-        if not self.detector.model_loaded:
-            if show_message:
-                messagebox.showerror(
-                    "Model Required",
-                    "Real Mode requires a loaded PPE model before detection can start.",
-                )
-            return False
-
-        model_classes = set(self.detector.get_model_classes())
-        unsupported = [item for item in self._get_enabled_target_items() if item not in model_classes]
-        if unsupported and show_message:
-            messagebox.showwarning(
-                "Model Capability",
-                "The loaded model does not support the selected PPE items:\n"
-                f"{', '.join(unsupported)}\n\n"
-                "Please load a PPE-specific model or switch to Demo Mode.",
-            )
-        return not unsupported
+        is_valid, message = self.detector.get_contract_validation(self._get_enabled_target_items())
+        if not is_valid and show_message:
+            title = "Model Required" if not self.detector.model_loaded else "Model Capability"
+            messagebox.showerror(title, message)
+        return is_valid
 
     def update_chart(self):
         self.ax.clear()
@@ -347,9 +340,30 @@ class HelmetDetectionApp:
 
         messagebox.showwarning("Screenshot", "Screenshot file not found.")
 
+    def ensure_run_output_dir(self):
+        if self.current_run_dir and os.path.exists(self.current_run_dir):
+            return self.current_run_dir
+
+        run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+        run_dir = os.path.join(self.output_root, run_name)
+        suffix = 1
+        while os.path.exists(run_dir):
+            run_dir = os.path.join(self.output_root, f"{run_name}_{suffix}")
+            suffix += 1
+
+        self.current_run_dir = run_dir
+        self.current_screenshots_dir = os.path.join(run_dir, "screenshots")
+        self.current_reports_dir = os.path.join(run_dir, "reports")
+        self.current_violation_csv_path = os.path.join(run_dir, "violations.csv")
+        self.current_heatmap_path = os.path.join(run_dir, "heatmap.png")
+        os.makedirs(self.current_screenshots_dir, exist_ok=True)
+        os.makedirs(self.current_reports_dir, exist_ok=True)
+        return run_dir
+
     def _build_report_filepath(self, fmt):
+        self.ensure_run_output_dir()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join("reports", f"ppe_violation_report_{timestamp}.{fmt}")
+        return os.path.join(self.current_reports_dir, f"ppe_violation_report_{timestamp}.{fmt}")
 
     def _export_report_file(self, fmt, filepath, processing_summary):
         if fmt == "csv":
@@ -383,6 +397,13 @@ class HelmetDetectionApp:
         }
         self.finalize_completed = False
         self.last_finalize_result = None
+        self.stop_requested = False
+        self.worker = None
+        self.current_run_dir = None
+        self.current_screenshots_dir = None
+        self.current_reports_dir = None
+        self.current_violation_csv_path = None
+        self.current_heatmap_path = None
         self.detector.reset_tracking()
         self.event_logger.clear_events()
         for item in self.tree.get_children():
@@ -396,16 +417,7 @@ class HelmetDetectionApp:
         self.update_chart()
 
     def clear_previous_outputs(self):
-        if not os.path.exists("violations"):
-            return
-
-        for filename in os.listdir("violations"):
-            filepath = os.path.join("violations", filename)
-            if os.path.isfile(filepath):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
+        os.makedirs(self.output_root, exist_ok=True)
 
     def open_file(self):
         path = filedialog.askopenfilename()
@@ -428,6 +440,7 @@ class HelmetDetectionApp:
             return
 
         self.reset_detection_state()
+        self.ensure_run_output_dir()
         self.enabled_items = {key: var.get() for key, var in self.check_vars.items()}
         self.vid = cv2.VideoCapture(source)
         if not self.vid.isOpened():
@@ -439,6 +452,7 @@ class HelmetDetectionApp:
         self.detector.processing_end_time = None
         self.detector.video_name = self.source_name
         self.running = True
+        self.stop_requested = False
         self.stop_event.clear()
         self.btn_upload.config(state=tk.DISABLED)
         self.btn_camera.config(state=tk.DISABLED)
@@ -497,8 +511,9 @@ class HelmetDetectionApp:
                     last_capture_time = last_capture_time_by_track.get(track_id, 0)
 
                     if current_time - last_capture_time > self.detector.violation_cooldown:
+                        self.ensure_run_output_dir()
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        screenshot_path = f"violations/v_{timestamp}_{track_id}.jpg"
+                        screenshot_path = os.path.join(self.current_screenshots_dir, f"v_{timestamp}_{track_id}.jpg")
                         cv2.imwrite(screenshot_path, annotated)
                         last_capture_time_by_track[track_id] = current_time
 
@@ -527,6 +542,7 @@ class HelmetDetectionApp:
 
     def handle_stop(self, stop_data=None):
         stop_data = stop_data or {"reason": "natural_end", "auto_report": True}
+        self.worker = None
         self.finalize_detection(
             auto_report=stop_data.get("auto_report", True),
             reason=stop_data.get("reason", "natural_end"),
@@ -534,17 +550,18 @@ class HelmetDetectionApp:
         )
 
     def _collect_finalize_artifacts(self, auto_report):
+        self.ensure_run_output_dir()
         violations_path = None
         heatmap_path = None
 
         if auto_report:
-            if self.detector.save_violation_log():
-                violations_path = os.path.abspath("violations/violations.csv")
+            if self.detector.save_violation_log(self.current_violation_csv_path):
+                violations_path = os.path.abspath(self.current_violation_csv_path)
 
             if self.detector.violation_coords:
                 heatmap = self.detector.generate_heatmap((500, 800, 3))
-                heatmap_path = os.path.abspath(os.path.join("reports", "violation_heatmap.jpg"))
-                cv2.imwrite(heatmap_path, heatmap)
+                cv2.imwrite(self.current_heatmap_path, heatmap)
+                heatmap_path = os.path.abspath(self.current_heatmap_path)
 
         return violations_path, heatmap_path
 
@@ -581,6 +598,8 @@ class HelmetDetectionApp:
         message_lines = [status_message, f"Source: {summary['source_name']}", f"Total violations: {summary['total_violations']}"]
         if error_message:
             message_lines.append(f"Error: {error_message}")
+        if self.current_run_dir:
+            message_lines.append(f"Run folder: {os.path.abspath(self.current_run_dir)}")
         if violations_path:
             message_lines.append(f"Violation log: {violations_path}")
         if heatmap_path:
@@ -596,6 +615,7 @@ class HelmetDetectionApp:
             "violations_path": violations_path,
             "heatmap_path": heatmap_path,
             "error": error_message,
+            "run_dir": self.current_run_dir,
         }
 
         if notify:
@@ -606,22 +626,28 @@ class HelmetDetectionApp:
 
         return self.last_finalize_result
 
+    def _warn_if_worker_still_running(self):
+        if self.stop_requested and self.worker is not None and self.worker.is_alive() and not self.finalize_completed:
+            self.set_status("Stopping is taking longer than expected. Waiting for worker thread to finish...")
+
     def stop_and_report(self):
-        self.set_status("Stopping detection and finalizing artifacts...")
+        if self.finalize_completed:
+            return self.last_finalize_result
+
+        self.stop_requested = True
+        self.set_status("Stopping detection. Waiting for worker thread to finish...")
         self.stop_event.set()
-
-        if self.worker is not None:
-            self.worker.join(timeout=5.0)
-            self.worker = None
-
-        self.finalize_detection(auto_report=True, reason="manual_stop")
+        self.window.after(5000, self._warn_if_worker_still_running)
+        return None
 
     def on_closing(self):
         self.stop_event.set()
         if self.worker is not None:
             self.worker.join(timeout=5.0)
-            self.worker = None
-        self.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
+            if self.worker is None or not self.worker.is_alive():
+                self.worker = None
+        if self.worker is None or not self.worker.is_alive():
+            self.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
         self.window.destroy()
 
 

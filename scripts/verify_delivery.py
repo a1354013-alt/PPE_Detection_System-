@@ -11,21 +11,23 @@ def build_python_command(*args):
     return [sys.executable, *args]
 
 
-def run_command(command, description):
+def run_command(command, description, capture_output=True):
     print(f"Running: {description}...", end=" ", flush=True)
     try:
         if isinstance(command, str):
-            result = subprocess.run(command, shell=True, capture_output=True, text=True)
+            result = subprocess.run(command, shell=True, capture_output=capture_output, text=True)
         else:
-            result = subprocess.run(command, shell=False, capture_output=True, text=True)
+            result = subprocess.run(command, shell=False, capture_output=capture_output, text=True)
 
         if result.returncode == 0:
             print_status(True)
-            return True, result.stdout
+            return True, result.stdout if capture_output else ""
 
         print_status(False)
-        print(f"\nError in {description}:\n{result.stderr or result.stdout}")
-        return False, result.stderr or result.stdout
+        if capture_output:
+            print(f"\nError in {description}:\n{result.stderr or result.stdout}")
+            return False, result.stderr or result.stdout
+        return False, ""
     except Exception as exc:
         print_status(False)
         print(f"\nException in {description}: {exc}")
@@ -33,9 +35,10 @@ def run_command(command, description):
 
 
 def check_tests():
-    success1, _ = run_command(build_python_command("-m", "compileall", "-q", "."), "compileall")
-    success2, _ = run_command(build_python_command("-m", "unittest", "discover", "-v"), "tests")
-    return success1 and success2
+    success1, _ = run_command(build_python_command("-m", "compileall", "-q", "."), "compileall", capture_output=False)
+    success2, _ = run_command(build_python_command("-m", "unittest", "discover", "-v"), "unittest", capture_output=False)
+    success3, _ = run_command(build_python_command("-m", "pytest", "-q"), "pytest", capture_output=False)
+    return success1 and success2 and success3
 
 
 def check_ignore_rules():
@@ -69,6 +72,7 @@ def check_ignore_rules():
         "*.env.*",
         "reports/",
         "violations/",
+        "outputs/",
         "*.mp4",
         "*.avi",
         "*.mov",
@@ -109,7 +113,9 @@ def check_readme_commands():
     required_commands = [
         "pip install -r requirements.txt",
         "python main_gui.py",
+        "python -m compileall -q .",
         "python -m unittest discover -v",
+        "pytest -q",
         "python scripts/verify_delivery.py",
     ]
 
@@ -150,6 +156,7 @@ def check_requirements():
         "pillow",
         "openpyxl",
         "reportlab",
+        "pytest",
     ]
 
     missing = [pkg for pkg in required_pkgs if pkg not in req_content]
@@ -165,7 +172,7 @@ def check_requirements():
 def check_forbidden_artifacts():
     print("Checking for forbidden artifacts...", end=" ", flush=True)
     forbidden_extensions = (".pt", ".pth", ".onnx", ".engine", ".weights", ".mp4", ".avi", ".mov", ".mkv", ".zip")
-    forbidden_dirs = ("reports", "violations")
+    forbidden_dirs = ("reports", "violations", "outputs")
     ignored_dirs = {"venv", ".venv", "__pycache__", ".pytest_cache", ".git"}
 
     found = []
@@ -193,7 +200,7 @@ def main():
     print("=== PPE Detection System Delivery Verification ===\n")
 
     checks = [
-        ("compileall & tests", check_tests),
+        ("compileall, unittest, and pytest", check_tests),
         ("ignore rules", check_ignore_rules),
         ("README commands", check_readme_commands),
         ("requirements", check_requirements),

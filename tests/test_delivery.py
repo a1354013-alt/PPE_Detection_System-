@@ -1,6 +1,8 @@
+import io
 import os
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from scripts import verify_delivery
@@ -15,6 +17,13 @@ class TestDeliveryScript(unittest.TestCase):
     def tearDown(self):
         os.chdir(self.original_cwd)
 
+    def _capture_check(self, func):
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            result = func()
+        return result, stdout_buffer.getvalue(), stderr_buffer.getvalue()
+
     def test_build_python_command_uses_current_interpreter(self):
         command = verify_delivery.build_python_command("-m", "compileall", "-q", ".")
         self.assertEqual(command[0], sys.executable)
@@ -27,6 +36,7 @@ class TestDeliveryScript(unittest.TestCase):
         required_rules = [
             "reports/",
             "violations/",
+            "outputs/",
             "*.mp4",
             "*.avi",
             "*.mov",
@@ -50,7 +60,10 @@ class TestDeliveryScript(unittest.TestCase):
         try:
             with open(".gitignore", "w", encoding="utf-8") as file_obj:
                 file_obj.write("__pycache__/\n")
-            self.assertFalse(verify_delivery.check_ignore_rules())
+            result, stdout_text, stderr_text = self._capture_check(verify_delivery.check_ignore_rules)
+            self.assertFalse(result)
+            self.assertIn("missing rules", stdout_text)
+            self.assertEqual(stderr_text, "")
         finally:
             with open(".gitignore", "w", encoding="utf-8") as file_obj:
                 file_obj.write(original_content)
@@ -62,7 +75,10 @@ class TestDeliveryScript(unittest.TestCase):
         try:
             with open("requirements.txt", "w", encoding="utf-8") as file_obj:
                 file_obj.write("numpy\npandas\n")
-            self.assertFalse(verify_delivery.check_requirements())
+            result, stdout_text, stderr_text = self._capture_check(verify_delivery.check_requirements)
+            self.assertFalse(result)
+            self.assertIn("missing", stdout_text)
+            self.assertEqual(stderr_text, "")
         finally:
             with open("requirements.txt", "w", encoding="utf-8") as file_obj:
                 file_obj.write(original_content)
@@ -74,7 +90,9 @@ class TestDeliveryScript(unittest.TestCase):
         ]
 
         with patch("scripts.verify_delivery.os.walk", return_value=fake_walk):
-            self.assertFalse(verify_delivery.check_forbidden_artifacts())
+            result, stdout_text, _ = self._capture_check(verify_delivery.check_forbidden_artifacts)
+            self.assertFalse(result)
+            self.assertIn("Forbidden artifacts found", stdout_text)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -11,6 +13,11 @@ class BoolVarStub:
 
     def get(self):
         return self.value
+
+
+class DummyWindow:
+    def after(self, *_args, **_kwargs):
+        return None
 
 
 class TestCli(unittest.TestCase):
@@ -36,24 +43,74 @@ class TestFinalizeFlow(unittest.TestCase):
     def test_handle_stop_uses_finalize_detection(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
         app.finalize_detection = Mock()
+        app.worker = Mock()
 
         app.handle_stop({"reason": "natural_end", "auto_report": True})
 
+        self.assertIsNone(app.worker)
         app.finalize_detection.assert_called_once_with(auto_report=True, reason="natural_end", error_message="")
 
-    def test_stop_and_report_uses_finalize_detection(self):
+    def test_stop_and_report_sets_stop_only_and_waits_for_queue_finalize(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.last_finalize_result = None
         app.set_status = Mock()
         app.stop_event = threading.Event()
-        worker = Mock()
-        app.worker = worker
-        app.finalize_detection = Mock()
+        app.stop_requested = False
+        app.window = DummyWindow()
+        app.worker = Mock()
 
-        app.stop_and_report()
+        result = app.stop_and_report()
 
+        self.assertIsNone(result)
         self.assertTrue(app.stop_event.is_set())
-        worker.join.assert_called_once_with(timeout=5.0)
-        app.finalize_detection.assert_called_once_with(auto_report=True, reason="manual_stop")
+        self.assertTrue(app.stop_requested)
+        app.set_status.assert_called_once()
+
+    def test_finalize_detection_is_idempotent(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.stop_event = threading.Event()
+        app.running = True
+        app.detector = Mock()
+        app.detector.processing_end_time = None
+        app.detector.get_processing_summary_data.return_value = {"source_name": "demo", "total_violations": 0}
+        app._collect_finalize_artifacts = Mock(return_value=(None, None))
+        app.btn_upload = Mock()
+        app.btn_camera = Mock()
+        app.vid = None
+        app.set_status = Mock()
+        app.demo_mode = False
+        app.current_run_dir = None
+        app.last_finalize_result = None
+
+        first = app.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
+        second = app.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
+
+        self.assertIs(first, second)
+        app._collect_finalize_artifacts.assert_called_once()
+
+    def test_finalize_detection_releases_video_after_worker_done(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.stop_event = threading.Event()
+        app.running = True
+        app.detector = Mock()
+        app.detector.processing_end_time = None
+        app.detector.get_processing_summary_data.return_value = {"source_name": "demo", "total_violations": 0}
+        app._collect_finalize_artifacts = Mock(return_value=(None, None))
+        app.btn_upload = Mock()
+        app.btn_camera = Mock()
+        vid = Mock()
+        app.vid = vid
+        app.set_status = Mock()
+        app.demo_mode = False
+        app.current_run_dir = None
+        app.last_finalize_result = None
+
+        app.handle_stop({"reason": "natural_end", "auto_report": True})
+
+        vid.release.assert_called_once()
 
 
 class TestStartDetectionValidation(unittest.TestCase):
@@ -74,14 +131,14 @@ class TestStartDetectionValidation(unittest.TestCase):
         self.assertFalse(app.running)
         app.set_status.assert_called_once()
 
-    @patch("main_gui.messagebox.showwarning")
-    def test_validate_model_support_returns_false_for_unsupported_items(self, mock_warning):
+    @patch("main_gui.messagebox.showerror")
+    def test_validate_model_support_returns_false_for_unsupported_contract(self, mock_error):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
         app.demo_mode = False
         app.update_model_info = Mock()
         app.detector = Mock()
         app.detector.model_loaded = True
-        app.detector.get_model_classes.return_value = ["person"]
+        app.detector.get_contract_validation.return_value = (False, "unsupported")
         app.check_vars = {
             "helmet": BoolVarStub(True),
             "vest": BoolVarStub(False),
@@ -92,7 +149,32 @@ class TestStartDetectionValidation(unittest.TestCase):
         result = app.validate_model_support(show_message=True)
 
         self.assertFalse(result)
-        mock_warning.assert_called_once()
+        mock_error.assert_called_once()
+
+
+class TestRunOutputs(unittest.TestCase):
+    def test_new_run_folder_preserves_existing_files(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        temp_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp_root, ignore_errors=True))
+        app.output_root = temp_root
+        app.current_run_dir = None
+        app.current_screenshots_dir = None
+        app.current_reports_dir = None
+        app.current_violation_csv_path = None
+        app.current_heatmap_path = None
+
+        first_run = app.ensure_run_output_dir()
+        first_file = os.path.join(first_run, "screenshots", "first.txt")
+        with open(first_file, "w", encoding="utf-8") as file_obj:
+            file_obj.write("keep me")
+
+        app.current_run_dir = None
+        second_run = app.ensure_run_output_dir()
+
+        self.assertNotEqual(first_run, second_run)
+        self.assertTrue(os.path.exists(first_file))
+        self.assertTrue(os.path.isdir(os.path.join(second_run, "screenshots")))
 
 
 if __name__ == "__main__":
