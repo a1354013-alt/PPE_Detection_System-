@@ -3,6 +3,7 @@
 This project provides a Tkinter-based PPE detection application focused on:
 
 - video / camera PPE inspection
+- region-based crowd gathering alerts
 - violation event logging and screenshots
 - CSV / Excel / PDF export
 - heatmap generation
@@ -83,13 +84,57 @@ The current model does not match the supported PPE contract. Please load a PPE-s
 - `yolov8n.pt` is not a PPE-specific model.
 - It is only suitable as an installation / GUI / pipeline smoke test.
 - Real PPE detection requires a PPE-trained model that matches the Real Mode contract above.
+- Region crowd alerts depend on the model's `person` detection quality.
+
+## Event Types
+
+The event pipeline supports:
+
+- `ppe_violation`: missing helmet, vest, mask, or goggles based on the selected PPE model contract.
+- `crowd_gathering`: too many detected people inside a configured region of interest.
+
+Both event types can be shown in the GUI event table and exported to CSV, Excel, and PDF.
+
+## Region-Based Crowd Gathering Alert
+
+The GUI includes a small "Region Crowd Alert" settings area:
+
+- Enable checkbox: turns the crowd alert on or off.
+- Region name: defaults to `Entrance`.
+- ROI coordinates: `x1`, `y1`, `x2`, `y2`, normalized from `0.0` to `1.0`.
+- Crowd threshold: defaults to `5`.
+- Temporal frames: defaults to `3`.
+- Cooldown seconds: defaults to `10`.
+
+ROI uses normalized coordinates. For example:
+
+```json
+{
+  "name": "Entrance",
+  "x1": 0.0,
+  "y1": 0.0,
+  "x2": 0.5,
+  "y2": 1.0,
+  "threshold": 5
+}
+```
+
+This represents the left half of the frame. A detected `person` counts for the region only when the center point of that person's bounding box is inside the ROI.
+
+Crowd alert logic:
+
+- YOLO `person` boxes are counted per configured ROI, not by whole-frame total alone.
+- `person_count >= threshold` becomes a candidate alert.
+- The candidate condition must remain stable for the configured temporal frames.
+- A cooldown prevents repeated alerts for the same region.
+- Severity is `medium` at threshold and `high` when `person_count >= threshold * 2`.
 
 ## Demo Mode
 
 Demo Mode is a fixed showcase flow for UI and reporting.
 
 - It is suitable for demonstrations in environments without a PPE model.
-- It simulates detections, event flow, screenshots, exports, and heatmap generation.
+- It simulates PPE detections, optional crowd gathering events, event flow, screenshots, exports, and heatmap generation.
 - It does not represent real model accuracy.
 - Demo Mode is not a fallback for Real Mode.
 - If Real Mode is unsupported, the app blocks startup instead of silently switching modes.
@@ -144,3 +189,5 @@ The CI flow is headless-safe. Tests mock GUI popups and use fake detector/model 
 - This repository does not include a training dataset.
 - This repository does not include PPE-specific trained weights.
 - Real-world accuracy depends on the chosen model, camera angle, lighting, occlusion, and jobsite conditions.
+- Crowd alert accuracy depends on `person` detection quality.
+- Occlusion, camera angle, lighting, and crowd density can affect person counting.

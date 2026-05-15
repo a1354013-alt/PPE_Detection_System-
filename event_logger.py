@@ -1,4 +1,5 @@
 import os
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import List
@@ -22,6 +23,14 @@ class ViolationEvent:
     screenshot_path: str
     confidence: float
     bbox: str
+    event_type: str = "ppe_violation"
+    category: str = "ppe"
+    severity: str = "medium"
+    details: str = ""
+    region_name: str = ""
+    threshold: int = 0
+    frame_index: int = 0
+    is_demo: bool = False
 
 
 class EventLogger:
@@ -64,9 +73,25 @@ class EventLogger:
                     "screenshot_path",
                     "confidence",
                     "bbox",
+                    "event_type",
+                    "category",
+                    "severity",
+                    "details",
+                    "region_name",
+                    "threshold",
+                    "frame_index",
+                    "is_demo",
                 ]
             )
         return pd.DataFrame([asdict(event) for event in self.events])
+
+    @staticmethod
+    def _event_type_counts(events):
+        counts = {}
+        for event in events:
+            event_type = getattr(event, "event_type", "ppe_violation") or "ppe_violation"
+            counts[event_type] = counts.get(event_type, 0) + 1
+        return counts
 
     def export_csv(self, filepath: str):
         self._ensure_output_dir(filepath)
@@ -91,15 +116,19 @@ class EventLogger:
             for cell in column:
                 try:
                     max_length = max(max_length, len(str(cell.value)))
-                except Exception:
-                    pass
+                except (TypeError, ValueError) as exc:
+                    logging.warning("Unable to size Excel column %s: %s", column_letter, exc)
             ws1.column_dimensions[column_letter].width = max_length + 2
 
         ws2 = wb.create_sheet(title="Summary")
         ws2.append(["Category", "Count"])
-        ws2.append(["Total Violation Events", len(self.events)])
+        ws2.append(["Total Safety Events", len(self.events)])
+        for event_type, count in self._event_type_counts(self.events).items():
+            ws2.append([f"{event_type} Events", count])
         for item, count in stats.get("missing_counts", {}).items():
             ws2.append([f"{item.capitalize()} Violations", count])
+        for region_name, count in stats.get("crowd_region_counts", {}).items():
+            ws2.append([f"Crowd Region: {region_name}", count])
 
         if processing_summary:
             ws2.append([])
@@ -118,15 +147,19 @@ class EventLogger:
         elements = []
         processing_summary = self._normalize_processing_summary(processing_summary)
 
-        elements.append(Paragraph("PPE Violation Report", styles["Title"]))
+        elements.append(Paragraph("Safety Event Report", styles["Title"]))
         elements.append(Spacer(1, 12))
         elements.append(Paragraph(f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]))
         elements.append(Paragraph(f"Total Events: {len(self.events)}", styles["Normal"]))
         elements.append(Spacer(1, 12))
 
         summary_data = [["Category", "Count"]]
+        for event_type, count in self._event_type_counts(self.events).items():
+            summary_data.append([f"{event_type} Events", str(count)])
         for item, count in stats.get("missing_counts", {}).items():
             summary_data.append([f"{item.capitalize()} Violations", str(count)])
+        for region_name, count in stats.get("crowd_region_counts", {}).items():
+            summary_data.append([f"Crowd Region: {region_name}", str(count)])
 
         summary_table = Table(summary_data, colWidths=[200, 100])
         summary_table.setStyle(
@@ -168,18 +201,19 @@ class EventLogger:
             elements.append(Spacer(1, 24))
 
         elements.append(Paragraph("Event Details (Top 50)", styles["Heading2"]))
-        detail_rows = [["Time", "ID", "Missing", "Conf"]]
+        detail_rows = [["Time", "Type", "Severity", "Details"]]
         for event in self.events[:50]:
+            details = event.details or event.missing_items or "-"
             detail_rows.append(
                 [
                     self._format_event_time(event.timestamp),
-                    event.track_id,
-                    event.missing_items,
-                    f"{event.confidence:.2f}",
+                    event.event_type,
+                    event.severity,
+                    details,
                 ]
             )
 
-        detail_table = Table(detail_rows, colWidths=[80, 80, 150, 60])
+        detail_table = Table(detail_rows, colWidths=[70, 100, 70, 220])
         detail_table.setStyle(
             TableStyle(
                 [
@@ -203,8 +237,8 @@ class EventLogger:
                         elements.append(Paragraph(f"Time: {event.timestamp} | ID: {event.track_id}", styles["Normal"]))
                         elements.append(image)
                         elements.append(Spacer(1, 12))
-                    except Exception:
-                        pass
+                    except (OSError, ValueError) as exc:
+                        logging.warning("Unable to add screenshot to PDF report: %s", exc)
 
         doc.build(elements)
         return filepath

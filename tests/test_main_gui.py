@@ -16,6 +16,10 @@ class BoolVarStub:
         return self.value
 
 
+class StringVarStub(BoolVarStub):
+    pass
+
+
 class DummyWindow:
     def after(self, *_args, **_kwargs):
         return None
@@ -218,6 +222,53 @@ class TestStartDetectionValidation(unittest.TestCase):
 
         self.assertFalse(result)
         mock_error.assert_called_once()
+
+    def test_crowd_settings_are_read_without_display(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.enable_crowd_region_alert = BoolVarStub(True)
+        app.crowd_region_name = StringVarStub("Entrance")
+        app.crowd_x1 = StringVarStub("0.1")
+        app.crowd_y1 = StringVarStub("0.2")
+        app.crowd_x2 = StringVarStub("0.8")
+        app.crowd_y2 = StringVarStub("0.9")
+        app.crowd_threshold = StringVarStub("7")
+        app.crowd_temporal_frames = StringVarStub("4")
+        app.crowd_cooldown_seconds = StringVarStub("12.5")
+
+        settings = app.get_crowd_settings()
+
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["region_name"], "Entrance")
+        self.assertEqual(settings["x1"], 0.1)
+        self.assertEqual(settings["threshold"], 7)
+        self.assertEqual(settings["temporal_frames"], 4)
+        self.assertEqual(settings["cooldown_seconds"], 12.5)
+
+    def test_crowd_event_ui_uses_generic_columns(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.stats = {"total_violations": 0, "missing_counts": {"helmet": 0}, "event_type_counts": {}, "severity_counts": {}, "crowd_region_counts": {}}
+        app.lbl_total_v = Mock()
+        app.update_chart = Mock()
+        app.tree = Mock()
+        app.tree.get_children.return_value = []
+
+        app.add_event_to_ui(
+            {
+                "timestamp": "2026-05-15 10:00:00",
+                "event_type": "crowd_gathering",
+                "severity": "high",
+                "details": "Entrance region crowd alert: 6 people detected, threshold is 5.",
+                "region_name": "Entrance",
+                "screenshot_path": "",
+                "missing_list": [],
+            }
+        )
+
+        self.assertEqual(app.stats["event_type_counts"]["crowd_gathering"], 1)
+        self.assertEqual(app.stats["crowd_region_counts"]["Entrance"], 1)
+        inserted_values = app.tree.insert.call_args.kwargs["values"]
+        self.assertEqual(inserted_values[1], "crowd_gathering")
+        self.assertEqual(inserted_values[2], "high")
 
 
 class TestRunOutputs(unittest.TestCase):

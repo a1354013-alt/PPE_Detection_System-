@@ -1,5 +1,7 @@
 import argparse
 import os
+import subprocess
+import sys
 import queue
 import threading
 import time
@@ -46,6 +48,9 @@ class HelmetDetectionApp:
 
         self.stats = {
             "total_violations": 0,
+            "event_type_counts": {},
+            "severity_counts": {},
+            "crowd_region_counts": {},
             "missing_counts": {
                 "helmet": 0,
                 "vest": 0,
@@ -64,9 +69,20 @@ class HelmetDetectionApp:
             self.window.after(500, self.show_demo_info)
 
     def setup_ui(self):
+        self.setup_header()
+        self.setup_main_layout()
+        self.setup_video_panel()
+        self.setup_event_table()
+        self.setup_model_panel()
+        self.setup_stats_panel()
+        self.setup_export_panel()
+        self.setup_bottom_controls()
+        self.setup_status_bar()
+        self.update_chart()
+
+    def setup_header(self):
         self.top_frame = tk.Frame(self.window, bg="#1e1e1e")
         self.top_frame.pack(pady=10, fill=tk.X)
-
         tk.Label(
             self.top_frame,
             text="PPE Detection System Pro",
@@ -75,30 +91,33 @@ class HelmetDetectionApp:
             fg="#00adb5",
         ).pack()
 
+    def setup_main_layout(self):
         self.main_frame = tk.Frame(self.window, bg="#1e1e1e")
         self.main_frame.pack(pady=10, fill=tk.BOTH, expand=True)
-
         self.left_panel = tk.Frame(self.main_frame, bg="#1e1e1e")
         self.left_panel.pack(side=tk.LEFT, padx=20, fill=tk.BOTH, expand=True)
+        self.right_frame = tk.Frame(self.main_frame, bg="#1e1e1e", width=400)
+        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=20)
 
+    def setup_video_panel(self):
         self.canvas = tk.Canvas(self.left_panel, width=800, height=500, bg="#000000", highlightthickness=0)
         self.canvas.pack(pady=5)
 
-        self.tree_frame = ttk.LabelFrame(self.left_panel, text="Violation Events")
+    def setup_event_table(self):
+        self.tree_frame = ttk.LabelFrame(self.left_panel, text="Safety Events")
         self.tree_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        columns = ("time", "track_id", "missing", "conf", "screenshot")
+        columns = ("time", "event_type", "severity", "details", "screenshot")
         self.tree = ttk.Treeview(self.tree_frame, columns=columns, show="headings", height=8)
-        self.tree.heading("time", text="Time")
-        self.tree.heading("track_id", text="Track ID")
-        self.tree.heading("missing", text="Missing PPE")
-        self.tree.heading("conf", text="Conf")
-        self.tree.heading("screenshot", text="Screenshot")
-        self.tree.column("time", width=150)
-        self.tree.column("track_id", width=100)
-        self.tree.column("missing", width=200)
-        self.tree.column("conf", width=80)
-        self.tree.column("screenshot", width=250)
+        headings = {
+            "time": ("Time", 150),
+            "event_type": ("Event Type", 130),
+            "severity": ("Severity", 80),
+            "details": ("Details", 260),
+            "screenshot": ("Screenshot", 250),
+        }
+        for column, (label, width) in headings.items():
+            self.tree.heading(column, text=label)
+            self.tree.column(column, width=width)
 
         scrollbar = ttk.Scrollbar(self.tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
@@ -106,24 +125,17 @@ class HelmetDetectionApp:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
 
-        self.right_frame = tk.Frame(self.main_frame, bg="#1e1e1e", width=400)
-        self.right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=20)
-
+    def setup_model_panel(self):
         self.model_frame = ttk.LabelFrame(self.right_frame, text="Model Information")
         self.model_frame.pack(fill=tk.X, pady=5)
-
         self.lbl_model_name = tk.Label(self.model_frame, bg="#1e1e1e", fg="white", font=("Arial", 10, "bold"), justify=tk.LEFT)
         self.lbl_model_name.pack(pady=2, anchor=tk.W)
-
         self.lbl_model_status = tk.Label(self.model_frame, bg="#1e1e1e", fg="white", font=("Arial", 9), justify=tk.LEFT, wraplength=360)
         self.lbl_model_status.pack(pady=2, anchor=tk.W)
-
         self.lbl_model_caps = tk.Label(self.model_frame, bg="#1e1e1e", fg="white", font=("Arial", 9), justify=tk.LEFT, wraplength=360)
         self.lbl_model_caps.pack(pady=2, anchor=tk.W)
-
         self.lbl_model_warning = tk.Label(self.model_frame, bg="#1e1e1e", fg="#f9ed69", font=("Arial", 9), justify=tk.LEFT, wraplength=360)
         self.lbl_model_warning.pack(pady=2, anchor=tk.W)
-
         tk.Button(
             self.model_frame,
             text="Load Model (.pt)",
@@ -132,16 +144,15 @@ class HelmetDetectionApp:
             fg="white",
         ).pack(fill=tk.X, pady=(4, 0))
 
+    def setup_stats_panel(self):
         self.fig, self.ax = plt.subplots(figsize=(4, 3), dpi=100)
         self.fig.patch.set_facecolor("#1e1e1e")
         self.ax.set_facecolor("#1e1e1e")
         self.ax.tick_params(colors="white")
         self.chart_canvas = FigureCanvasTkAgg(self.fig, master=self.right_frame)
         self.chart_canvas.get_tk_widget().pack(fill=tk.X, pady=5)
-
         self.stats_frame = ttk.LabelFrame(self.right_frame, text="Statistics")
         self.stats_frame.pack(fill=tk.X, pady=10)
-
         self.lbl_total_v = tk.Label(
             self.stats_frame,
             text="Total violations: 0",
@@ -151,9 +162,9 @@ class HelmetDetectionApp:
         )
         self.lbl_total_v.pack(pady=5)
 
+    def setup_export_panel(self):
         self.export_frame = ttk.LabelFrame(self.right_frame, text="Export Report")
         self.export_frame.pack(fill=tk.X, pady=10)
-
         tk.Button(
             self.export_frame,
             text="Export CSV",
@@ -176,13 +187,17 @@ class HelmetDetectionApp:
             fg="white",
         ).pack(fill=tk.X, pady=2)
 
+    def setup_bottom_controls(self):
         self.bottom_frame = tk.Frame(self.window, bg="#1e1e1e")
         self.bottom_frame.pack(pady=10, fill=tk.X)
+        self.setup_ppe_checkboxes()
+        self.setup_crowd_controls()
+        self.setup_action_buttons()
 
+    def setup_ppe_checkboxes(self):
         self.check_frame = tk.Frame(self.bottom_frame, bg="#1e1e1e")
         self.check_frame.pack()
         self.check_vars = {item: tk.BooleanVar(value=(item == "helmet")) for item in ["helmet", "vest", "goggles", "mask"]}
-
         for item, var in self.check_vars.items():
             checkbox = tk.Checkbutton(
                 self.check_frame,
@@ -196,9 +211,40 @@ class HelmetDetectionApp:
             )
             checkbox.pack(side=tk.LEFT, padx=15)
 
+    def setup_crowd_controls(self):
+        self.crowd_frame = ttk.LabelFrame(self.bottom_frame, text="Region Crowd Alert")
+        self.crowd_frame.pack(fill=tk.X, padx=20, pady=5)
+        self.enable_crowd_region_alert = tk.BooleanVar(value=False)
+        self.crowd_region_name = tk.StringVar(value="Entrance")
+        self.crowd_x1 = tk.StringVar(value="0.0")
+        self.crowd_y1 = tk.StringVar(value="0.0")
+        self.crowd_x2 = tk.StringVar(value="1.0")
+        self.crowd_y2 = tk.StringVar(value="1.0")
+        self.crowd_threshold = tk.StringVar(value="5")
+        self.crowd_temporal_frames = tk.StringVar(value="3")
+        self.crowd_cooldown_seconds = tk.StringVar(value="10")
+
+        tk.Checkbutton(
+            self.crowd_frame,
+            text="Enable",
+            variable=self.enable_crowd_region_alert,
+            bg="#1e1e1e",
+            fg="white",
+            selectcolor="#393e46",
+            activebackground="#1e1e1e",
+        ).grid(row=0, column=0, padx=5, pady=2)
+        self._add_crowd_entry("Name", self.crowd_region_name, 1, 10)
+        self._add_crowd_entry("x1", self.crowd_x1, 2, 5)
+        self._add_crowd_entry("y1", self.crowd_y1, 3, 5)
+        self._add_crowd_entry("x2", self.crowd_x2, 4, 5)
+        self._add_crowd_entry("y2", self.crowd_y2, 5, 5)
+        self._add_crowd_entry("Threshold", self.crowd_threshold, 6, 5)
+        self._add_crowd_entry("Frames", self.crowd_temporal_frames, 7, 5)
+        self._add_crowd_entry("Cooldown", self.crowd_cooldown_seconds, 8, 5)
+
+    def setup_action_buttons(self):
         self.btn_frame = tk.Frame(self.bottom_frame, bg="#1e1e1e")
         self.btn_frame.pack(pady=10)
-
         button_style = {"font": ("Arial", 10, "bold"), "width": 15, "height": 2, "bd": 0, "cursor": "hand2"}
         self.btn_upload = tk.Button(self.btn_frame, text="Open File", command=self.open_file, bg="#393e46", fg="white", **button_style)
         self.btn_upload.grid(row=0, column=0, padx=10)
@@ -207,11 +253,14 @@ class HelmetDetectionApp:
         self.btn_stop = tk.Button(self.btn_frame, text="Stop && Finalize", command=self.stop_and_report, bg="#ff4b2b", fg="white", **button_style)
         self.btn_stop.grid(row=0, column=2, padx=10)
 
+    def setup_status_bar(self):
         self.status_var = tk.StringVar(value="Ready.")
         self.status_label = tk.Label(self.window, textvariable=self.status_var, bg="#1e1e1e", fg="#cfd8dc", anchor="w")
         self.status_label.pack(fill=tk.X, padx=20, pady=(0, 10))
 
-        self.update_chart()
+    def _add_crowd_entry(self, label, variable, column, width):
+        tk.Label(self.crowd_frame, text=label, bg="#1e1e1e", fg="white").grid(row=0, column=column * 2 - 1, padx=(8, 2))
+        tk.Entry(self.crowd_frame, textvariable=variable, width=width).grid(row=0, column=column * 2, padx=(0, 4))
 
     def set_status(self, text):
         self.status_var.set(text)
@@ -259,12 +308,47 @@ class HelmetDetectionApp:
     def _get_enabled_target_items(self):
         return [item for item, var in self.check_vars.items() if var.get()]
 
+    @staticmethod
+    def _parse_float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _parse_int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def get_crowd_settings(self):
+        return {
+            "enabled": bool(self.enable_crowd_region_alert.get()),
+            "region_name": self.crowd_region_name.get() or "Entrance",
+            "x1": self._parse_float(self.crowd_x1.get(), 0.0),
+            "y1": self._parse_float(self.crowd_y1.get(), 0.0),
+            "x2": self._parse_float(self.crowd_x2.get(), 1.0),
+            "y2": self._parse_float(self.crowd_y2.get(), 1.0),
+            "threshold": self._parse_int(self.crowd_threshold.get(), 5),
+            "temporal_frames": self._parse_int(self.crowd_temporal_frames.get(), 3),
+            "cooldown_seconds": self._parse_float(self.crowd_cooldown_seconds.get(), 10),
+        }
+
+    def apply_crowd_settings_to_detector(self):
+        if not hasattr(self, "detector"):
+            return
+        self.detector.configure_crowd_monitor(**self.get_crowd_settings())
+
     def validate_model_support(self, show_message=True):
         self.update_model_info()
         if self.demo_mode:
             return True
 
         is_valid, message = self.detector.get_contract_validation(self._get_enabled_target_items())
+        if not is_valid and hasattr(self, "enable_crowd_region_alert") and self.enable_crowd_region_alert.get():
+            self.set_status("PPE model contract is unsupported. Running enabled crowd alert only.")
+            return True
         if not is_valid and show_message:
             title = "Model Required" if not self.detector.model_loaded else "Model Capability"
             messagebox.showerror(title, message)
@@ -303,6 +387,13 @@ class HelmetDetectionApp:
 
     def add_event_to_ui(self, event_dict):
         self.stats["total_violations"] += 1
+        event_type = event_dict.get("event_type", "ppe_violation")
+        severity = event_dict.get("severity", "medium")
+        self.stats["event_type_counts"][event_type] = self.stats["event_type_counts"].get(event_type, 0) + 1
+        self.stats["severity_counts"][severity] = self.stats["severity_counts"].get(severity, 0) + 1
+        if event_type == "crowd_gathering":
+            region_name = event_dict.get("region_name", "unknown") or "unknown"
+            self.stats["crowd_region_counts"][region_name] = self.stats["crowd_region_counts"].get(region_name, 0) + 1
         for missing_item in event_dict.get("missing_list", []):
             if missing_item in self.stats["missing_counts"]:
                 self.stats["missing_counts"][missing_item] += 1
@@ -315,9 +406,9 @@ class HelmetDetectionApp:
             0,
             values=(
                 event_dict.get("timestamp", ""),
-                event_dict.get("track_id", ""),
-                event_dict.get("missing_items", ""),
-                f"{event_dict.get('confidence', 0):.2f}",
+                event_type,
+                severity,
+                event_dict.get("details", "") or event_dict.get("missing_items", "-"),
                 event_dict.get("screenshot_path", ""),
             ),
         )
@@ -332,13 +423,19 @@ class HelmetDetectionApp:
 
         screenshot_path = self.tree.item(selected[0], "values")[4]
         if screenshot_path and os.path.exists(screenshot_path):
-            if os.name == "nt":
-                os.startfile(screenshot_path)
-            else:
-                os.system(f'xdg-open "{screenshot_path}"')
+            self.open_path(screenshot_path)
             return
 
         messagebox.showwarning("Screenshot", "Screenshot file not found.")
+
+    @staticmethod
+    def open_path(path):
+        if os.name == "nt":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def ensure_run_output_dir(self):
         if self.current_run_dir and os.path.exists(self.current_run_dir):
@@ -393,6 +490,9 @@ class HelmetDetectionApp:
     def reset_detection_state(self):
         self.stats = {
             "total_violations": 0,
+            "event_type_counts": {},
+            "severity_counts": {},
+            "crowd_region_counts": {},
             "missing_counts": {"helmet": 0, "vest": 0, "goggles": 0, "mask": 0},
         }
         self.finalize_completed = False
@@ -435,12 +535,14 @@ class HelmetDetectionApp:
         if self.running:
             return
 
+        self.apply_crowd_settings_to_detector()
         if not self.demo_mode and not self.validate_model_support(show_message=True):
             self.set_status("Detection blocked until a compatible PPE model is loaded.")
             return
 
         self.reset_detection_state()
         self.ensure_run_output_dir()
+        self.apply_crowd_settings_to_detector()
         self.enabled_items = {key: var.get() for key, var in self.check_vars.items()}
         self.vid = cv2.VideoCapture(source)
         if not self.vid.isOpened():
@@ -513,7 +615,8 @@ class HelmetDetectionApp:
                     if current_time - last_capture_time > self.detector.violation_cooldown:
                         self.ensure_run_output_dir()
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        screenshot_path = os.path.join(self.current_screenshots_dir, f"v_{timestamp}_{track_id}.jpg")
+                        safe_track_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(track_id))
+                        screenshot_path = os.path.join(self.current_screenshots_dir, f"v_{timestamp}_{safe_track_id}.jpg")
                         cv2.imwrite(screenshot_path, annotated)
                         last_capture_time_by_track[track_id] = current_time
 
@@ -526,6 +629,14 @@ class HelmetDetectionApp:
                         screenshot_path=screenshot_path,
                         confidence=event_data.get("confidence", 0),
                         bbox=event_data.get("bbox", ""),
+                        event_type=event_data.get("event_type", "ppe_violation"),
+                        category=event_data.get("category", "ppe"),
+                        severity=event_data.get("severity", "medium"),
+                        details=event_data.get("details", ""),
+                        region_name=event_data.get("region_name", ""),
+                        threshold=self._parse_int(event_data.get("threshold", 0), 0),
+                        frame_index=self._parse_int(event_data.get("frame_index", event_data.get("frame", 0)), 0),
+                        is_demo=bool(event_data.get("is_demo", False)),
                     )
                     self.event_logger.add_event(event)
                     event_data["screenshot_path"] = screenshot_path

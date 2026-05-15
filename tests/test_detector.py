@@ -352,5 +352,91 @@ class TestRealModeContracts(unittest.TestCase):
         self.assertEqual(info["error"], UNSUPPORTED_MODEL_ERROR)
 
 
+class TestCrowdDetectorIntegration(unittest.TestCase):
+    def setUp(self):
+        self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def test_persons_inside_roi_create_crowd_event(self):
+        detector = create_detector({0: "person"})
+        detector.configure_crowd_monitor(
+            enabled=True,
+            region_name="Entrance",
+            x1=0.0,
+            y1=0.0,
+            x2=0.5,
+            y2=1.0,
+            threshold=2,
+            temporal_frames=1,
+            cooldown_seconds=0,
+        )
+        result = make_result(
+            {0: "person"},
+            [
+                (0, [10, 10, 100, 200], 0.95, 1),
+                (0, [120, 10, 200, 200], 0.95, 2),
+                (0, [500, 10, 600, 200], 0.95, 3),
+            ],
+        )
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, [], source_name="cam", frame_number=1)
+
+        crowd_events = [event for event in info["new_events"] if event["event_type"] == "crowd_gathering"]
+        self.assertEqual(len(crowd_events), 1)
+        self.assertEqual(crowd_events[0]["person_count"], 2)
+        self.assertEqual(info["missing_items"], [])
+
+    def test_persons_outside_roi_do_not_create_crowd_event(self):
+        detector = create_detector({0: "person"})
+        detector.configure_crowd_monitor(True, "Entrance", 0.0, 0.0, 0.5, 1.0, 2, 1, 0)
+        result = make_result(
+            {0: "person"},
+            [
+                (0, [400, 10, 500, 200], 0.95, 1),
+                (0, [500, 10, 600, 200], 0.95, 2),
+            ],
+        )
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, [], source_name="cam", frame_number=1)
+
+        self.assertEqual(info["new_events"], [])
+
+    def test_ppe_violation_and_crowd_gathering_can_coexist(self):
+        detector = create_detector({0: "person", 1: "hardhat"})
+        detector.configure_crowd_monitor(True, "Entrance", 0.0, 0.0, 1.0, 1.0, 1, 1, 0)
+        result = make_result({0: "person", 1: "hardhat"}, [(0, [100, 100, 220, 360], 0.95, 1)])
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, ["helmet"], source_name="cam", frame_number=1)
+
+        self.assertEqual({event["event_type"] for event in info["new_events"]}, {"ppe_violation", "crowd_gathering"})
+        ppe_event = [event for event in info["new_events"] if event["event_type"] == "ppe_violation"][0]
+        self.assertEqual(ppe_event["missing_list"], ["helmet"])
+
+    def test_crowd_event_does_not_mutate_ppe_missing_items(self):
+        detector = create_detector({0: "person"})
+        detector.configure_crowd_monitor(True, "Entrance", 0.0, 0.0, 1.0, 1.0, 1, 1, 0)
+        result = make_result({0: "person"}, [(0, [100, 100, 220, 360], 0.95, 1)])
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, [], source_name="cam", frame_number=1)
+
+        self.assertTrue(info["violation_detected"])
+        self.assertEqual(info["missing_items"], [])
+        self.assertEqual(info["stable_violations"], [])
+
+    def test_demo_mode_can_emit_crowd_event(self):
+        detector = create_detector(demo_mode=True)
+        detector.configure_crowd_monitor(True, "Demo Entrance", 0.0, 0.0, 1.0, 1.0, 1, 1, 0)
+
+        _, info = detector.detect(self.frame, [], source_name="demo", frame_number=1)
+
+        crowd_events = [event for event in info["new_events"] if event["event_type"] == "crowd_gathering"]
+        self.assertTrue(crowd_events)
+        self.assertTrue(crowd_events[0]["is_demo"])
+        self.assertIn("Demo", crowd_events[0]["details"])
+
+
 if __name__ == "__main__":
     unittest.main()

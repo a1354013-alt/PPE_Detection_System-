@@ -10,6 +10,8 @@ from datetime import datetime
 import cv2
 import numpy as np
 
+from crowd_monitor import CrowdMonitor, CrowdRegion
+
 
 DEMO_RANDOM_SEED = 42
 MODEL_NOT_LOADED_ERROR = "Model is not loaded. Please load a PPE model or enable Demo Mode."
@@ -76,6 +78,8 @@ class HelmetDetector:
         self.temporal_frames = self.config.get("temporal_frames", 3)
         self.cooldown_seconds = self.config.get("cooldown_seconds", 2)
         self.demo_rng = random.Random(DEMO_RANDOM_SEED)
+        self.crowd_monitor = CrowdMonitor([], temporal_frames=3, cooldown_seconds=10)
+        self.crowd_enabled = False
 
         self.class_map = self._build_class_map()
 
@@ -134,6 +138,142 @@ class HelmetDetector:
             "is_demo": False,
             "error": error,
         }
+
+    def configure_crowd_monitor(
+        self,
+        enabled=False,
+        region_name="Entrance",
+        x1=0.0,
+        y1=0.0,
+        x2=1.0,
+        y2=1.0,
+        threshold=5,
+        temporal_frames=3,
+        cooldown_seconds=10,
+    ):
+        self.crowd_enabled = bool(enabled)
+        if self.crowd_enabled:
+            region = CrowdRegion(
+                name=region_name,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                threshold=threshold,
+                severity="medium",
+            )
+            self.crowd_monitor = CrowdMonitor(
+                regions=[region],
+                temporal_frames=temporal_frames,
+                cooldown_seconds=cooldown_seconds,
+            )
+        else:
+            self.crowd_monitor = CrowdMonitor([], temporal_frames=temporal_frames, cooldown_seconds=cooldown_seconds)
+        return self.crowd_monitor
+
+    def _get_crowd_events(self, persons, frame, frame_number, timestamp_str, source_name, is_demo=False):
+        if not self.crowd_enabled:
+            return []
+        person_boxes = [person[0] for person in persons]
+        return self.crowd_monitor.update(
+            person_boxes,
+            frame_index=frame_number,
+            timestamp=timestamp_str,
+            frame_shape=frame.shape[:2],
+            source_name=source_name,
+            is_demo=is_demo,
+        )
+
+    @staticmethod
+    def _build_ppe_event_details(stable_missing):
+        return f"PPE violation: missing {', '.join(stable_missing)}."
+
+    @staticmethod
+    def _format_bbox(p_box):
+        return (
+            f"x={int(p_box[0])},"
+            f"y={int(p_box[1])},"
+            f"w={int(p_box[2] - p_box[0])},"
+            f"h={int(p_box[3] - p_box[1])}"
+        )
+
+    def _build_ppe_event(self, track_id, stable_missing, p_box, person_conf, persons, timestamp_str, source_name, frame_number, is_demo):
+        center_x = (p_box[0] + p_box[2]) / 2
+        center_y = (p_box[1] + p_box[3]) / 2
+        return {
+            "event_type": "ppe_violation",
+            "category": "ppe",
+            "severity": "medium",
+            "timestamp": timestamp_str,
+            "frame": frame_number,
+            "frame_index": frame_number,
+            "source": source_name,
+            "track_id": track_id,
+            "person_count": len(persons),
+            "missing_items": ", ".join(stable_missing) if stable_missing else "None",
+            "confidence": person_conf,
+            "bbox": self._format_bbox(p_box),
+            "center_x": center_x,
+            "center_y": center_y,
+            "missing_list": stable_missing,
+            "bbox_raw": p_box,
+            "details": self._build_ppe_event_details(stable_missing),
+            "region_name": "",
+            "threshold": "",
+            "is_demo": bool(is_demo),
+        }
+
+    def _record_event(self, event):
+        self.violation_log.append(event)
+        if event.get("event_type") == "ppe_violation":
+            center_x = event.get("center_x")
+            center_y = event.get("center_y")
+            if center_x is not None and center_y is not None:
+                self.violation_coords.append((center_x, center_y))
+
+    def _draw_ppe_event_label(self, annotated_frame, track_id, stable_missing, p_box, is_demo):
+        label = f"MISSING: {', '.join(stable_missing)}" if is_demo else f"ID:{track_id} MISSING: {', '.join(stable_missing)}"
+        y_coord = int(p_box[3]) + 20 if is_demo else int(p_box[1]) - 10
+        cv2.putText(
+            annotated_frame,
+            label,
+            (int(p_box[0]), y_coord),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 255),
+            2,
+        )
+
+    def _collect_stable_ppe_violations(self, merged_missing):
+        frame_violations = []
+        for track_id, track_state in merged_missing.items():
+            stable_missing = self.update_temporal_state(track_id, track_state["missing"])
+            if stable_missing:
+                frame_violations.append((track_id, stable_missing, track_state["bbox"], track_state["confidence"]))
+        return frame_violations
+
+    def _build_detection_info(self, persons, stable_violations_output, crowd_events, new_event_data, fps, is_demo, error="", ppe_error=""):
+        all_missing = [item for _, missing_items, _ in stable_violations_output for item in missing_items]
+        info = {
+            "person_count": len(persons),
+            "violation_detected": bool(stable_violations_output or crowd_events),
+            "missing_items": sorted(set(all_missing)),
+            "stable_violations": stable_violations_output,
+            "new_events": new_event_data,
+            "fps": fps,
+            "is_demo": bool(is_demo),
+            "error": error,
+        }
+        if ppe_error:
+            info["ppe_error"] = ppe_error
+        return info
+
+    def _update_frame_counters(self):
+        self.frame_count += 1
+        elapsed = time.time() - self.start_time
+        fps = self.frame_count / elapsed if elapsed > 0 else 0
+        self.total_frames_processed += 1
+        return fps
 
     @staticmethod
     def _sanitize_label(label):
@@ -493,8 +633,10 @@ class HelmetDetector:
             return self._detect_demo(frame, target_items, source_name, frame_number)
 
         selected_items = [item for item in target_items if item in self.PPE_ITEMS]
-        is_valid_contract, contract_error = self.get_contract_validation(selected_items)
-        if not is_valid_contract:
+        is_valid_contract, contract_error = True, ""
+        if selected_items:
+            is_valid_contract, contract_error = self.get_contract_validation(selected_items)
+        if not is_valid_contract and not self.crowd_enabled:
             return frame, self._build_empty_detection_info(error=contract_error)
 
         current_time = time.time()
@@ -510,7 +652,7 @@ class HelmetDetector:
         supported_classes = set(self.model_capabilities.get("presence_items", []))
 
         presence_missing_by_track = {}
-        if self.model_capabilities.get("contract_mode") in {"presence-based", "mixed"}:
+        if is_valid_contract and self.model_capabilities.get("contract_mode") in {"presence-based", "mixed"}:
             for p_box, track_id, person_conf in persons:
                 person_missing = self._check_ppe_missing(p_box, items, selected_items, supported_classes)
                 self.person_states[track_id] = {
@@ -521,13 +663,11 @@ class HelmetDetector:
                 }
                 presence_missing_by_track[track_id] = person_missing
 
-        merged_missing = self._merge_missing_by_track(persons, presence_missing_by_track, direct_violations)
+        merged_missing = {}
+        if is_valid_contract:
+            merged_missing = self._merge_missing_by_track(persons, presence_missing_by_track, direct_violations)
 
-        frame_violations = []
-        for track_id, track_state in merged_missing.items():
-            stable_missing = self.update_temporal_state(track_id, track_state["missing"])
-            if stable_missing:
-                frame_violations.append((track_id, stable_missing, track_state["bbox"], track_state["confidence"]))
+        frame_violations = self._collect_stable_ppe_violations(merged_missing)
 
         new_event_data = []
         stable_violations_output = []
@@ -541,62 +681,39 @@ class HelmetDetector:
             for key in cooldown_keys:
                 self.counted_violations[key] = current_time
 
-            bbox_str = (
-                f"x={int(p_box[0])},"
-                f"y={int(p_box[1])},"
-                f"w={int(p_box[2] - p_box[0])},"
-                f"h={int(p_box[3] - p_box[1])}"
+            event = self._build_ppe_event(
+                track_id,
+                stable_missing,
+                p_box,
+                person_conf,
+                persons,
+                timestamp_str,
+                source_name,
+                frame_number,
+                is_demo=False,
             )
-
-            center_x = (p_box[0] + p_box[2]) / 2
-            center_y = (p_box[1] + p_box[3]) / 2
-            event = {
-                "timestamp": timestamp_str,
-                "frame": frame_number,
-                "source": source_name,
-                "track_id": track_id,
-                "person_count": len(persons),
-                "missing_items": ", ".join(stable_missing),
-                "confidence": person_conf,
-                "bbox": bbox_str,
-                "center_x": center_x,
-                "center_y": center_y,
-                "missing_list": stable_missing,
-                "bbox_raw": p_box,
-                "is_demo": False,
-            }
 
             new_event_data.append(event)
-            self.violation_log.append(event)
+            self._record_event(event)
             stable_violations_output.append((track_id, stable_missing, p_box))
-            self.violation_coords.append((center_x, center_y))
 
-            cv2.putText(
-                annotated_frame,
-                f"ID:{track_id} MISSING: {', '.join(stable_missing)}",
-                (int(p_box[0]), int(p_box[1]) - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-            )
+            self._draw_ppe_event_label(annotated_frame, track_id, stable_missing, p_box, is_demo=False)
 
-        all_missing = [item for _, missing_items, _ in stable_violations_output for item in missing_items]
-        self.frame_count += 1
-        elapsed = time.time() - self.start_time
-        fps = self.frame_count / elapsed if elapsed > 0 else 0
-        self.total_frames_processed += 1
+        crowd_events = self._get_crowd_events(persons, annotated_frame, frame_number, timestamp_str, source_name, is_demo=False)
+        for event in crowd_events:
+            new_event_data.append(event)
+            self._record_event(event)
+        fps = self._update_frame_counters()
 
-        return annotated_frame, {
-            "person_count": len(persons),
-            "violation_detected": bool(stable_violations_output),
-            "missing_items": sorted(set(all_missing)),
-            "stable_violations": stable_violations_output,
-            "new_events": new_event_data,
-            "fps": fps,
-            "is_demo": False,
-            "error": "",
-        }
+        return annotated_frame, self._build_detection_info(
+            persons,
+            stable_violations_output,
+            crowd_events,
+            new_event_data,
+            fps,
+            is_demo=False,
+            ppe_error=contract_error if not is_valid_contract else "",
+        )
 
     def generate_heatmap(self, shape):
         heatmap = np.zeros(shape[:2], dtype=np.float32)
@@ -618,11 +735,17 @@ class HelmetDetector:
             writer.writerow(
                 [
                     "timestamp",
+                    "event_type",
+                    "category",
+                    "severity",
                     "frame",
                     "source",
                     "track_id",
                     "person_count",
                     "missing_items",
+                    "region_name",
+                    "threshold",
+                    "details",
                     "confidence",
                     "bbox",
                     "center_x",
@@ -634,11 +757,17 @@ class HelmetDetector:
                 writer.writerow(
                     [
                         entry.get("timestamp", ""),
+                        entry.get("event_type", "ppe_violation"),
+                        entry.get("category", "ppe"),
+                        entry.get("severity", "medium"),
                         entry.get("frame", ""),
                         entry.get("source", ""),
                         entry.get("track_id", ""),
                         entry.get("person_count", ""),
                         entry.get("missing_items", ""),
+                        entry.get("region_name", ""),
+                        entry.get("threshold", ""),
+                        entry.get("details", ""),
                         entry.get("confidence", ""),
                         entry.get("bbox", ""),
                         entry.get("center_x", ""),
@@ -653,6 +782,7 @@ class HelmetDetector:
         self.person_states = {}
         self.violation_coords.clear()
         self.person_buffers.clear()
+        self.crowd_monitor.reset()
         self.violation_log.clear()
         self.frame_count = 0
         self.start_time = time.time()
@@ -670,7 +800,10 @@ class HelmetDetector:
             avg_fps = self.total_frames_processed / processing_time if processing_time > 0 else 0
 
         missing_counter = {}
+        event_type_counter = {}
         for event in self.violation_log:
+            event_type = event.get("event_type", "ppe_violation")
+            event_type_counter[event_type] = event_type_counter.get(event_type, 0) + 1
             for item in event.get("missing_list", []):
                 missing_counter[item] = missing_counter.get(item, 0) + 1
 
@@ -689,6 +822,7 @@ class HelmetDetector:
             "total_frames": self.total_frames_processed,
             "average_fps": f"{avg_fps:.2f}",
             "total_violations": len(self.violation_log),
+            "event_type_counts": event_type_counter,
             "most_missing_item": most_missing,
             "model_name": snapshot["display_name"],
             "model_status": snapshot["status_message"],
@@ -799,59 +933,35 @@ class HelmetDetector:
             for key in cooldown_keys:
                 self.counted_violations[key] = current_time
 
-            bbox_str = (
-                f"x={int(p_box[0])},"
-                f"y={int(p_box[1])},"
-                f"w={int(p_box[2] - p_box[0])},"
-                f"h={int(p_box[3] - p_box[1])}"
+            event = self._build_ppe_event(
+                track_id,
+                stable_missing,
+                p_box,
+                person_conf,
+                persons,
+                timestamp_str,
+                source_name,
+                frame_number,
+                is_demo=True,
             )
-
-            center_x = (p_box[0] + p_box[2]) / 2
-            center_y = (p_box[1] + p_box[3]) / 2
-            event = {
-                "timestamp": timestamp_str,
-                "frame": frame_number,
-                "source": source_name,
-                "track_id": track_id,
-                "person_count": len(persons),
-                "missing_items": ", ".join(stable_missing) if stable_missing else "None",
-                "confidence": person_conf,
-                "bbox": bbox_str,
-                "center_x": center_x,
-                "center_y": center_y,
-                "missing_list": stable_missing,
-                "bbox_raw": p_box,
-                "is_demo": True,
-            }
 
             new_event_data.append(event)
-            self.violation_log.append(event)
+            self._record_event(event)
             stable_violations_output.append((track_id, stable_missing, p_box))
-            self.violation_coords.append((center_x, center_y))
 
-            cv2.putText(
-                annotated_frame,
-                f"MISSING: {', '.join(stable_missing)}",
-                (int(p_box[0]), int(p_box[3]) + 20),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-            )
+            self._draw_ppe_event_label(annotated_frame, track_id, stable_missing, p_box, is_demo=True)
 
-        all_missing = [item for _, missing_items, _ in stable_violations_output for item in missing_items]
-        self.frame_count += 1
-        elapsed = time.time() - self.start_time
-        fps = self.frame_count / elapsed if elapsed > 0 else 0
-        self.total_frames_processed += 1
+        crowd_events = self._get_crowd_events(persons, annotated_frame, frame_number, timestamp_str, source_name, is_demo=True)
+        for event in crowd_events:
+            new_event_data.append(event)
+            self._record_event(event)
+        fps = self._update_frame_counters()
 
-        return annotated_frame, {
-            "person_count": len(persons),
-            "violation_detected": bool(stable_violations_output),
-            "missing_items": sorted(set(all_missing)),
-            "stable_violations": stable_violations_output,
-            "new_events": new_event_data,
-            "is_demo": True,
-            "fps": fps,
-            "error": "",
-        }
+        return annotated_frame, self._build_detection_info(
+            persons,
+            stable_violations_output,
+            crowd_events,
+            new_event_data,
+            fps,
+            is_demo=True,
+        )
