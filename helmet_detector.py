@@ -2,7 +2,6 @@ import csv
 import json
 import os
 import random
-import re
 import time
 from collections import Counter, deque
 from datetime import datetime
@@ -11,6 +10,7 @@ import cv2
 import numpy as np
 
 from crowd_monitor import CrowdMonitor, CrowdRegion
+from ppe_model_registry import normalize_label
 
 
 DEMO_RANDOM_SEED = 42
@@ -32,34 +32,66 @@ class HelmetDetector:
 
     PRESENCE_CLASS_ALIASES = {
         "person": "person",
+        "worker": "person",
+        "people": "person",
         "helmet": "helmet",
         "hardhat": "helmet",
         "hard hat": "helmet",
+        "hard_hat": "helmet",
         "hardhat helmet": "helmet",
         "safety helmet": "helmet",
+        "safety_helmet": "helmet",
         "head helmet": "helmet",
         "vest": "vest",
         "safety vest": "vest",
+        "safety_vest": "vest",
+        "safety-vest": "vest",
         "safetyvest": "vest",
         "reflective vest": "vest",
+        "reflective_vest": "vest",
         "reflectivevest": "vest",
         "goggles": "goggles",
+        "safety goggles": "goggles",
+        "safety_goggles": "goggles",
         "eye protection": "goggles",
         "eyeprotection": "goggles",
         "mask": "mask",
         "face mask": "mask",
+        "face_mask": "mask",
         "facemask": "mask",
     }
     VIOLATION_CLASS_ALIASES = {
+        "no_helmet": "missing_helmet",
+        "no-helmet": "missing_helmet",
         "no helmet": "missing_helmet",
+        "without_helmet": "missing_helmet",
+        "without helmet": "missing_helmet",
+        "no_hardhat": "missing_helmet",
+        "no-hardhat": "missing_helmet",
         "no hardhat": "missing_helmet",
         "no hard hat": "missing_helmet",
         "bare head": "missing_helmet",
+        "no_vest": "missing_vest",
+        "no-vest": "missing_vest",
         "no vest": "missing_vest",
+        "no_safety_vest": "missing_vest",
+        "no-safety vest": "missing_vest",
+        "no-safety-vest": "missing_vest",
         "no safety vest": "missing_vest",
         "no safetyvest": "missing_vest",
+        "without_vest": "missing_vest",
+        "without vest": "missing_vest",
+        "no reflective vest": "missing_vest",
+        "no_mask": "missing_mask",
+        "no-mask": "missing_mask",
         "no mask": "missing_mask",
+        "without_mask": "missing_mask",
+        "without mask": "missing_mask",
+        "no_goggles": "missing_goggles",
+        "no-goggles": "missing_goggles",
         "no goggles": "missing_goggles",
+        "without_goggles": "missing_goggles",
+        "without goggles": "missing_goggles",
         "no ppe": "missing_all",
     }
 
@@ -83,10 +115,14 @@ class HelmetDetector:
 
         self.class_map = self._build_class_map()
 
-        if not demo_mode or (model_path and os.path.exists(model_path)):
+        if model_path and (not demo_mode or os.path.exists(model_path)):
             self.load_model(model_path)
         else:
-            self.model_status_message = "Demo Mode active. No PPE model loaded."
+            self.model_status_message = (
+                "Demo Mode active. No PPE model loaded."
+                if demo_mode
+                else "No PPE model selected. Load a PPE model or choose Demo Mode."
+            )
 
         self.person_states = {}
         self.person_buffers = {}
@@ -277,9 +313,7 @@ class HelmetDetector:
 
     @staticmethod
     def _sanitize_label(label):
-        lowered = str(label).strip().lower()
-        lowered = lowered.replace("-", " ").replace("_", " ")
-        return re.sub(r"\s+", " ", lowered)
+        return normalize_label(label)
 
     def normalize_class_name(self, label):
         sanitized = self._sanitize_label(label)

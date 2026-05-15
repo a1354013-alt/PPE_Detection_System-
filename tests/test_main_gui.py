@@ -1,4 +1,5 @@
 import os
+import queue
 import tempfile
 import threading
 import unittest
@@ -23,6 +24,16 @@ class StringVarStub(BoolVarStub):
 class DummyWindow:
     def after(self, *_args, **_kwargs):
         return None
+
+
+class FakeVideoCapture:
+    def __init__(self, frames):
+        self.frames = list(frames)
+
+    def read(self):
+        if not self.frames:
+            return False, None
+        return True, self.frames.pop(0)
 
 
 class TestCli(unittest.TestCase):
@@ -184,6 +195,54 @@ class TestFinalizeFlow(unittest.TestCase):
         app._collect_finalize_artifacts.assert_called_once()
         vid.release.assert_called_once()
 
+    def test_detection_worker_runtime_error_still_sends_stop(self):
+        numpy = __import__("numpy")
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.stop_event = threading.Event()
+        app.vid = FakeVideoCapture([numpy.zeros((20, 20, 3), dtype="uint8")])
+        app.enabled_items = {"helmet": True}
+        app.source_name = "unit"
+        app.result_queue = queue.Queue()
+        app.detector = Mock()
+        app.detector.detect.side_effect = RuntimeError("detector exploded")
+
+        app.detection_worker()
+
+        messages = []
+        while not app.result_queue.empty():
+            messages.append(app.result_queue.get())
+        self.assertEqual(messages[-1][0], "STOP")
+        self.assertEqual(messages[-1][1]["reason"], "error")
+        self.assertFalse(messages[-1][1]["auto_report"])
+        self.assertIn("detector exploded", messages[-1][1]["error"])
+
+    def test_error_stop_finalize_resets_running_and_does_not_auto_report(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.stop_event = threading.Event()
+        app.running = True
+        app.detector = Mock()
+        app.detector.processing_end_time = None
+        app.detector.get_processing_summary_data.return_value = {"source_name": "demo", "total_violations": 0}
+        app._collect_finalize_artifacts = Mock(return_value=(None, None))
+        app.btn_upload = Mock()
+        app.btn_camera = Mock()
+        app.btn_stop = Mock()
+        app.vid = None
+        app.set_status = Mock()
+        app.demo_mode = False
+        app.current_run_dir = None
+        app.last_finalize_result = None
+        app.worker = Mock()
+
+        app.handle_stop({"reason": "error", "auto_report": False, "error": "boom", "notify": False})
+
+        self.assertFalse(app.running)
+        app.btn_upload.config.assert_called_with(state=main_gui.tk.NORMAL)
+        app.btn_camera.config.assert_called_with(state=main_gui.tk.NORMAL)
+        app._collect_finalize_artifacts.assert_called_once_with(False)
+        self.assertEqual(app.last_finalize_result["error"], "boom")
+
 
 class TestStartDetectionValidation(unittest.TestCase):
     @patch("main_gui.cv2.VideoCapture")
@@ -222,6 +281,59 @@ class TestStartDetectionValidation(unittest.TestCase):
 
         self.assertFalse(result)
         mock_error.assert_called_once()
+
+    @patch("main_gui.messagebox.showerror")
+    def test_crowd_enabled_no_model_loaded_cannot_start(self, mock_error):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.demo_mode = False
+        app.update_model_info = Mock()
+        app.detector = Mock()
+        app.detector.model_loaded = False
+        app.detector.model_capabilities = {"person": False}
+        app.enable_crowd_region_alert = BoolVarStub(True)
+        app.check_vars = {"helmet": BoolVarStub(False), "vest": BoolVarStub(False), "goggles": BoolVarStub(False), "mask": BoolVarStub(False)}
+
+        self.assertFalse(app.validate_model_support(show_message=True))
+        mock_error.assert_called_once()
+
+    @patch("main_gui.messagebox.showerror")
+    def test_crowd_enabled_without_person_class_cannot_start(self, mock_error):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.demo_mode = False
+        app.update_model_info = Mock()
+        app.detector = Mock()
+        app.detector.model_loaded = True
+        app.detector.model_capabilities = {"person": False}
+        app.enable_crowd_region_alert = BoolVarStub(True)
+        app.check_vars = {"helmet": BoolVarStub(False), "vest": BoolVarStub(False), "goggles": BoolVarStub(False), "mask": BoolVarStub(False)}
+
+        self.assertFalse(app.validate_model_support(show_message=True))
+        mock_error.assert_called_once()
+
+    def test_crowd_enabled_with_person_class_can_start(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.demo_mode = False
+        app.update_model_info = Mock()
+        app.set_status = Mock()
+        app.detector = Mock()
+        app.detector.model_loaded = True
+        app.detector.model_capabilities = {"person": True}
+        app.detector.get_contract_validation.return_value = (False, "ppe unsupported")
+        app.enable_crowd_region_alert = BoolVarStub(True)
+        app.check_vars = {"helmet": BoolVarStub(False), "vest": BoolVarStub(False), "goggles": BoolVarStub(False), "mask": BoolVarStub(False)}
+
+        self.assertTrue(app.validate_model_support(show_message=False))
+        app.set_status.assert_called_once()
+
+    def test_demo_mode_crowd_enabled_can_start(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.demo_mode = True
+        app.update_model_info = Mock()
+        app.set_status = Mock()
+        app.enable_crowd_region_alert = BoolVarStub(True)
+
+        self.assertTrue(app.validate_model_support(show_message=False))
+        app.set_status.assert_called_once()
 
     def test_crowd_settings_are_read_without_display(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)

@@ -84,15 +84,12 @@ class TestDeliveryScript(unittest.TestCase):
                 file_obj.write(original_content)
 
     def test_forbidden_artifact_checker_detects_files(self):
-        fake_walk = [
-            (".", ["tests"], ["README.md", "temp_test_model.pt"]),
-            (os.path.join(".", "tests"), [], []),
-        ]
+        fake_result = type("Result", (), {"returncode": 0, "stdout": "README.md\ntemp_test_model.pt\n"})()
 
-        with patch("scripts.verify_delivery.os.walk", return_value=fake_walk):
+        with patch("scripts.verify_delivery.subprocess.run", return_value=fake_result):
             result, stdout_text, _ = self._capture_check(verify_delivery.check_forbidden_artifacts)
             self.assertFalse(result)
-            self.assertIn("Forbidden artifacts found", stdout_text)
+            self.assertIn("Forbidden tracked artifacts found", stdout_text)
 
 
 if __name__ == "__main__":

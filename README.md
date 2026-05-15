@@ -78,11 +78,51 @@ Real Mode requires either:
 The current model does not match the supported PPE contract. Please load a PPE-specific model or use Demo Mode.
 ```
 
-## Default `yolov8n.pt` Limitation
+## PPE Model Setup
 
-- The default path is `yolov8n.pt`.
+This repository does not redistribute model weights. Download public PPE models yourself, review their licenses, and keep the `.pt` files outside Git history.
+
+Recommended pretrained models:
+
+- `Hexmon/vyra-yolo-ppe-detection`: YOLOv8 PPE model with classes such as `Person`, `Hardhat`, `NO-Hardhat`, `Safety Vest`, `NO-Safety Vest`, `Mask`, and `NO-Mask`.
+- `Hansung-Cho/yolov8-ppe-detection`: YOLOv8n PPE model with classes such as `Person`, `Hardhat`, `No-Hardhat`, `Safety Vest`, `No-Safety Vest`, `Mask`, and `No-Mask`.
+
+Download both recommended models:
+
+```bash
+python scripts/download_ppe_models.py --model all
+```
+
+Download a single profile:
+
+```bash
+python scripts/download_ppe_models.py --model hexmon
+python scripts/download_ppe_models.py --model hansung
+```
+
+Verify the model contract after download:
+
+```bash
+python scripts/check_ppe_model.py --profile hexmon
+python scripts/check_ppe_model.py --profile hansung
+python scripts/check_ppe_model.py --model-path models/hexmon_vyra_yolo_ppe_best.pt
+```
+
+The checker loads the model with Ultralytics YOLO, reads `model.names`, normalizes class names, and reports person/PPE capabilities. Names such as `NO-Hardhat`, `No-Hardhat`, `no_hardhat`, and `no hardhat` are treated as the same class. `Safety Vest`, `safety_vest`, and `safety-vest` are also treated as the same class.
+
+## Why `yolov8n.pt` Is Not A PPE Model
+
+`yolov8n.pt` is a general COCO model. It can be useful for smoke testing installation, GUI startup, or basic person detection, but it is not a formal PPE model and should not be presented as one. Real PPE detection requires PPE-trained classes that match the model contract.
+
+## Portfolio Disclaimer
+
+This project is portfolio/demo software. Model licensing, deployment permission, calibration data, camera placement, lighting, occlusion, site-specific PPE rules, and human review remain the responsibility of the user. Do not use the output as the sole safety enforcement mechanism in a real workplace.
+
+## Smoke Test `yolov8n.pt` Limitation
+
 - `yolov8n.pt` is not a PPE-specific model.
 - It is only suitable as an installation / GUI / pipeline smoke test.
+- Real Mode does not silently fall back to `yolov8n.pt` when a PPE model is missing.
 - Real PPE detection requires a PPE-trained model that matches the Real Mode contract above.
 - Region crowd alerts depend on the model's `person` detection quality.
 

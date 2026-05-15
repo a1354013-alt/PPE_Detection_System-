@@ -16,6 +16,15 @@ from PIL import Image, ImageTk
 
 from event_logger import EventLogger, ViolationEvent
 from helmet_detector import HelmetDetector
+from ppe_model_registry import get_profile
+
+
+CROWD_PERSON_REQUIRED_ERROR = "Current model does not support person detection required for crowd monitoring."
+MODEL_SOURCE_OPTIONS = {
+    "Custom local model": None,
+    "Hexmon Vyra YOLO PPE": "hexmon",
+    "Hansung YOLOv8 PPE": "hansung",
+}
 
 
 class HelmetDetectionApp:
@@ -25,7 +34,7 @@ class HelmetDetectionApp:
         self.window.geometry("1400x950")
         self.window.configure(bg="#1e1e1e")
 
-        self.detector = HelmetDetector(model_path=model_path or "yolov8n.pt", demo_mode=demo_mode)
+        self.detector = HelmetDetector(model_path=model_path, demo_mode=demo_mode)
         self.event_logger = EventLogger()
         self.demo_mode = demo_mode
         self.running = False
@@ -38,6 +47,7 @@ class HelmetDetectionApp:
         self.finalize_completed = False
         self.last_finalize_result = None
         self.stop_requested = False
+        self.model_source_var = tk.StringVar(value="Custom local model")
 
         self.output_root = "outputs"
         self.current_run_dir = None
@@ -128,6 +138,15 @@ class HelmetDetectionApp:
     def setup_model_panel(self):
         self.model_frame = ttk.LabelFrame(self.right_frame, text="Model Information")
         self.model_frame.pack(fill=tk.X, pady=5)
+        tk.Label(self.model_frame, text="PPE Model Source", bg="#1e1e1e", fg="white").pack(pady=(2, 0), anchor=tk.W)
+        self.model_source_combo = ttk.Combobox(
+            self.model_frame,
+            textvariable=self.model_source_var,
+            values=list(MODEL_SOURCE_OPTIONS.keys()),
+            state="readonly",
+        )
+        self.model_source_combo.pack(fill=tk.X, pady=(0, 4))
+        self.model_source_combo.bind("<<ComboboxSelected>>", self.on_model_source_selected)
         self.lbl_model_name = tk.Label(self.model_frame, bg="#1e1e1e", fg="white", font=("Arial", 10, "bold"), justify=tk.LEFT)
         self.lbl_model_name.pack(pady=2, anchor=tk.W)
         self.lbl_model_status = tk.Label(self.model_frame, bg="#1e1e1e", fg="white", font=("Arial", 9), justify=tk.LEFT, wraplength=360)
@@ -143,6 +162,30 @@ class HelmetDetectionApp:
             bg="#393e46",
             fg="white",
         ).pack(fill=tk.X, pady=(4, 0))
+
+    def on_model_source_selected(self, _event=None):
+        selected = self.model_source_var.get()
+        profile_alias = MODEL_SOURCE_OPTIONS.get(selected)
+        if not profile_alias:
+            self.set_status("Custom local model selected. Use Load Model (.pt) to choose a PPE model.")
+            return
+
+        profile = get_profile(profile_alias)
+        if not os.path.exists(profile.local_path):
+            command = f"python scripts/download_ppe_models.py --model {profile_alias}"
+            message = f"尚未下載 PPE 模型，請先執行：\n{command}"
+            self.set_status(message)
+            messagebox.showwarning("PPE Model Not Downloaded", message)
+            self.update_model_info()
+            return
+
+        success, message = self.detector.load_model(profile.local_path)
+        self.detector.reset_tracking()
+        self.update_model_info()
+        if success:
+            self.set_status(f"Loaded PPE model source: {selected}")
+        else:
+            messagebox.showerror("Model", message)
 
     def setup_stats_panel(self):
         self.fig, self.ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -296,6 +339,7 @@ class HelmetDetectionApp:
             return
 
         success, message = self.detector.load_model(path)
+        self.model_source_var.set("Custom local model")
         if success:
             self.detector.reset_tracking()
             self.update_model_info()
@@ -343,11 +387,19 @@ class HelmetDetectionApp:
     def validate_model_support(self, show_message=True):
         self.update_model_info()
         if self.demo_mode:
+            self.set_status("Demo Mode enabled. Crowd/PPE events are simulated, not real PPE detection.")
             return True
 
+        crowd_enabled = hasattr(self, "enable_crowd_region_alert") and self.enable_crowd_region_alert.get()
+        if crowd_enabled:
+            if not self.detector.model_loaded or not self.detector.model_capabilities.get("person"):
+                if show_message:
+                    messagebox.showerror("Crowd Monitoring Requires Person Detection", CROWD_PERSON_REQUIRED_ERROR)
+                return False
+
         is_valid, message = self.detector.get_contract_validation(self._get_enabled_target_items())
-        if not is_valid and hasattr(self, "enable_crowd_region_alert") and self.enable_crowd_region_alert.get():
-            self.set_status("PPE model contract is unsupported. Running enabled crowd alert only.")
+        if not is_valid and crowd_enabled and not self._get_enabled_target_items():
+            self.set_status("Running crowd monitoring with a person-capable model.")
             return True
         if not is_valid and show_message:
             title = "Model Required" if not self.detector.model_loaded else "Model Capability"
@@ -558,6 +610,7 @@ class HelmetDetectionApp:
         self.stop_event.clear()
         self.btn_upload.config(state=tk.DISABLED)
         self.btn_camera.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
         self.set_status(f"Running detection on {self.source_name}...")
 
         self.worker = threading.Thread(target=self.detection_worker, daemon=True)
@@ -568,88 +621,94 @@ class HelmetDetectionApp:
         frame_number = 0
         stop_payload = None
 
-        while not self.stop_event.is_set():
-            ret, frame = self.vid.read()
-            if not ret:
-                break
+        try:
+            while not self.stop_event.is_set():
+                ret, frame = self.vid.read()
+                if not ret:
+                    break
 
-            frame_height, frame_width = frame.shape[:2]
-            scale = min(800 / frame_width, 500 / frame_height)
-            new_w = int(frame_width * scale)
-            new_h = int(frame_height * scale)
-            display_frame = cv2.resize(frame, (new_w, new_h))
-            canvas_frame = cv2.copyMakeBorder(
-                display_frame,
-                0,
-                500 - new_h,
-                0,
-                800 - new_w,
-                cv2.BORDER_CONSTANT,
-                value=(0, 0, 0),
-            )
+                frame_height, frame_width = frame.shape[:2]
+                scale = min(800 / frame_width, 500 / frame_height)
+                new_w = int(frame_width * scale)
+                new_h = int(frame_height * scale)
+                display_frame = cv2.resize(frame, (new_w, new_h))
+                canvas_frame = cv2.copyMakeBorder(
+                    display_frame,
+                    0,
+                    500 - new_h,
+                    0,
+                    800 - new_w,
+                    cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
 
-            targets = [key for key, enabled in self.enabled_items.items() if enabled]
-            annotated, info = self.detector.detect(
-                canvas_frame,
-                targets,
-                source_name=self.source_name,
-                frame_number=frame_number,
-            )
-            self.result_queue.put(("FRAME", annotated))
+                targets = [key for key, enabled in self.enabled_items.items() if enabled]
+                annotated, info = self.detector.detect(
+                    canvas_frame,
+                    targets,
+                    source_name=self.source_name,
+                    frame_number=frame_number,
+                )
+                self.result_queue.put(("FRAME", annotated))
 
-            if info.get("error"):
-                stop_payload = {
-                    "reason": "error",
-                    "auto_report": False,
-                    "error": info["error"],
-                }
-                break
+                if info.get("error"):
+                    stop_payload = {
+                        "reason": "error",
+                        "auto_report": False,
+                        "error": info["error"],
+                    }
+                    break
 
-            if info.get("violation_detected"):
-                for event_data in info.get("new_events", []):
-                    current_time = time.time()
-                    screenshot_path = ""
-                    track_id = event_data.get("track_id", "unknown")
-                    last_capture_time = last_capture_time_by_track.get(track_id, 0)
+                if info.get("violation_detected"):
+                    for event_data in info.get("new_events", []):
+                        current_time = time.time()
+                        screenshot_path = ""
+                        track_id = event_data.get("track_id", "unknown")
+                        last_capture_time = last_capture_time_by_track.get(track_id, 0)
 
-                    if current_time - last_capture_time > self.detector.violation_cooldown:
-                        self.ensure_run_output_dir()
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        safe_track_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(track_id))
-                        screenshot_path = os.path.join(self.current_screenshots_dir, f"v_{timestamp}_{safe_track_id}.jpg")
-                        cv2.imwrite(screenshot_path, annotated)
-                        last_capture_time_by_track[track_id] = current_time
+                        if current_time - last_capture_time > self.detector.violation_cooldown:
+                            self.ensure_run_output_dir()
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            safe_track_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(track_id))
+                            screenshot_path = os.path.join(self.current_screenshots_dir, f"v_{timestamp}_{safe_track_id}.jpg")
+                            cv2.imwrite(screenshot_path, annotated)
+                            last_capture_time_by_track[track_id] = current_time
 
-                    event = ViolationEvent(
-                        timestamp=event_data.get("timestamp", ""),
-                        source=event_data.get("source", self.source_name),
-                        track_id=event_data.get("track_id", ""),
-                        person_count=event_data.get("person_count", 0),
-                        missing_items=event_data.get("missing_items", ""),
-                        screenshot_path=screenshot_path,
-                        confidence=event_data.get("confidence", 0),
-                        bbox=event_data.get("bbox", ""),
-                        event_type=event_data.get("event_type", "ppe_violation"),
-                        category=event_data.get("category", "ppe"),
-                        severity=event_data.get("severity", "medium"),
-                        details=event_data.get("details", ""),
-                        region_name=event_data.get("region_name", ""),
-                        threshold=self._parse_int(event_data.get("threshold", 0), 0),
-                        frame_index=self._parse_int(event_data.get("frame_index", event_data.get("frame", 0)), 0),
-                        is_demo=bool(event_data.get("is_demo", False)),
-                    )
-                    self.event_logger.add_event(event)
-                    event_data["screenshot_path"] = screenshot_path
-                    self.result_queue.put(("EVENT", event_data))
+                        event = ViolationEvent(
+                            timestamp=event_data.get("timestamp", ""),
+                            source=event_data.get("source", self.source_name),
+                            track_id=event_data.get("track_id", ""),
+                            person_count=event_data.get("person_count", 0),
+                            missing_items=event_data.get("missing_items", ""),
+                            screenshot_path=screenshot_path,
+                            confidence=event_data.get("confidence", 0),
+                            bbox=event_data.get("bbox", ""),
+                            event_type=event_data.get("event_type", "ppe_violation"),
+                            category=event_data.get("category", "ppe"),
+                            severity=event_data.get("severity", "medium"),
+                            details=event_data.get("details", ""),
+                            region_name=event_data.get("region_name", ""),
+                            threshold=self._parse_int(event_data.get("threshold", 0), 0),
+                            frame_index=self._parse_int(event_data.get("frame_index", event_data.get("frame", 0)), 0),
+                            is_demo=bool(event_data.get("is_demo", False)),
+                        )
+                        self.event_logger.add_event(event)
+                        event_data["screenshot_path"] = screenshot_path
+                        self.result_queue.put(("EVENT", event_data))
 
-            frame_number += 1
-            time.sleep(0.01)
+                frame_number += 1
+                time.sleep(0.01)
 
-        if stop_payload is None:
-            stop_reason = "manual_stop" if self.stop_event.is_set() else "natural_end"
-            stop_payload = {"reason": stop_reason, "auto_report": True}
+            if stop_payload is None:
+                stop_reason = "manual_stop" if self.stop_event.is_set() else "natural_end"
+                stop_payload = {"reason": stop_reason, "auto_report": True, "error": ""}
+        except Exception as exc:
+            stop_payload = {"reason": "error", "auto_report": False, "error": str(exc)}
+        finally:
+            if stop_payload is None:
+                stop_payload = {"reason": "error", "auto_report": False, "error": "Detection worker stopped unexpectedly."}
 
-        self.result_queue.put(("STOP", stop_payload))
+            self.result_queue.put(("STOP", stop_payload))
 
     def handle_stop(self, stop_data=None):
         stop_data = stop_data or {"reason": "natural_end", "auto_report": True}
@@ -694,6 +753,8 @@ class HelmetDetectionApp:
 
         self.btn_upload.config(state=tk.NORMAL)
         self.btn_camera.config(state=tk.NORMAL)
+        if hasattr(self, "btn_stop"):
+            self.btn_stop.config(state=tk.NORMAL)
 
         violations_path, heatmap_path = self._collect_finalize_artifacts(auto_report)
         summary = self.detector.get_processing_summary_data()

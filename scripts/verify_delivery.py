@@ -73,6 +73,11 @@ def check_ignore_rules():
         "reports/",
         "violations/",
         "outputs/",
+        "runs/",
+        "models/*.pt",
+        "models/*.onnx",
+        "models/*.engine",
+        "!models/.gitkeep",
         "*.mp4",
         "*.avi",
         "*.mov",
@@ -99,6 +104,24 @@ def check_ignore_rules():
     return True
 
 
+def check_ppe_model_delivery_files():
+    print("Checking PPE model delivery files...", end=" ", flush=True)
+    required_paths = [
+        "scripts/download_ppe_models.py",
+        "scripts/check_ppe_model.py",
+        "ppe_model_registry.py",
+        "models/.gitkeep",
+    ]
+    missing = [path for path in required_paths if not os.path.exists(path)]
+    if missing:
+        print_status(False)
+        print(f"\nError: Missing PPE model delivery files: {', '.join(missing)}")
+        return False
+
+    print_status(True)
+    return True
+
+
 def check_readme_commands():
     print("Checking README commands...", end=" ", flush=True)
     readme_path = "README.md"
@@ -113,6 +136,10 @@ def check_readme_commands():
     required_commands = [
         "pip install -r requirements.txt",
         "python main_gui.py",
+        "## PPE Model Setup",
+        "python scripts/download_ppe_models.py --model all",
+        "python scripts/check_ppe_model.py --profile hexmon",
+        "python scripts/check_ppe_model.py --profile hansung",
         "python -m compileall -q .",
         "python -m unittest discover -v",
         "pytest -q",
@@ -157,6 +184,7 @@ def check_requirements():
         "openpyxl",
         "reportlab",
         "pytest",
+        "huggingface_hub>=0.23,<1",
     ]
 
     missing = [pkg for pkg in required_pkgs if pkg not in req_content]
@@ -170,26 +198,32 @@ def check_requirements():
 
 
 def check_forbidden_artifacts():
-    print("Checking for forbidden artifacts...", end=" ", flush=True)
+    print("Checking for tracked forbidden artifacts...", end=" ", flush=True)
     forbidden_extensions = (".pt", ".pth", ".onnx", ".engine", ".weights", ".mp4", ".avi", ".mov", ".mkv", ".zip")
-    forbidden_dirs = ("reports", "violations", "outputs")
-    ignored_dirs = {"venv", ".venv", "__pycache__", ".pytest_cache", ".git"}
+    forbidden_dirs = ("reports/", "violations/", "outputs/", "runs/")
+    try:
+        result = subprocess.run(["git", "ls-files"], shell=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            tracked_files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        else:
+            tracked_files = []
+    except Exception:
+        tracked_files = []
 
-    found = []
-    for root, dirs, files in os.walk("."):
-        dirs[:] = [directory for directory in dirs if directory not in ignored_dirs and not directory.startswith(".")]
+    if not tracked_files:
+        tracked_files = []
+        for root, _dirs, files in os.walk("."):
+            for filename in files:
+                tracked_files.append(os.path.normpath(os.path.join(root, filename)).lstrip("." + os.sep))
 
-        rel_root = os.path.relpath(root, ".")
-        in_forbidden_dir = any(rel_root == forbidden_dir or rel_root.startswith(forbidden_dir + os.sep) for forbidden_dir in forbidden_dirs)
-
-        for filename in files:
-            rel_path = os.path.normpath(os.path.join(root, filename))
-            if filename.endswith(forbidden_extensions) or in_forbidden_dir:
-                found.append(rel_path)
+    found = [
+        path for path in tracked_files
+        if path.endswith(forbidden_extensions) or any(path == directory.rstrip("/") or path.startswith(directory) for directory in forbidden_dirs)
+    ]
 
     if found:
         print_status(False)
-        print("\nError: Forbidden artifacts found:\n" + "\n".join(found))
+        print("\nError: Forbidden tracked artifacts found:\n" + "\n".join(found))
         return False
 
     print_status(True)
@@ -202,6 +236,7 @@ def main():
     checks = [
         ("compileall, unittest, and pytest", check_tests),
         ("ignore rules", check_ignore_rules),
+        ("PPE model delivery files", check_ppe_model_delivery_files),
         ("README commands", check_readme_commands),
         ("requirements", check_requirements),
         ("delivery artifacts clean", check_forbidden_artifacts),
