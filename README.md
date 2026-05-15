@@ -137,6 +137,8 @@ GitHub Actions runs the same acceptance commands:
 - `pytest -q`
 - `python scripts/verify_delivery.py`
 
+The CI flow is headless-safe. Tests mock GUI popups and use fake detector/model objects, so the runner does not need a display server, webcam, PPE weights, or model downloads.
+
 ## Known Limitations
 
 - This repository does not include a training dataset.

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import main_gui
+from event_logger import EventLogger, ViolationEvent
 
 
 class BoolVarStub:
@@ -40,15 +41,29 @@ class TestCli(unittest.TestCase):
 
 
 class TestFinalizeFlow(unittest.TestCase):
+    def setUp(self):
+        self.messagebox_patches = [
+            patch("main_gui.messagebox.showinfo"),
+            patch("main_gui.messagebox.showwarning"),
+            patch("main_gui.messagebox.showerror"),
+        ]
+        self.mock_messageboxes = [patcher.start() for patcher in self.messagebox_patches]
+        self.addCleanup(lambda: [patcher.stop() for patcher in self.messagebox_patches])
+
     def test_handle_stop_uses_finalize_detection(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
         app.finalize_detection = Mock()
         app.worker = Mock()
 
-        app.handle_stop({"reason": "natural_end", "auto_report": True})
+        app.handle_stop({"reason": "natural_end", "auto_report": True, "notify": False})
 
         self.assertIsNone(app.worker)
-        app.finalize_detection.assert_called_once_with(auto_report=True, reason="natural_end", error_message="")
+        app.finalize_detection.assert_called_once_with(
+            auto_report=True,
+            reason="natural_end",
+            error_message="",
+            notify=False,
+        )
 
     def test_stop_and_report_sets_stop_only_and_waits_for_queue_finalize(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
@@ -66,6 +81,7 @@ class TestFinalizeFlow(unittest.TestCase):
         self.assertTrue(app.stop_event.is_set())
         self.assertTrue(app.stop_requested)
         app.set_status.assert_called_once()
+        self.assertFalse(app.finalize_completed)
 
     def test_finalize_detection_is_idempotent(self):
         app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
@@ -108,8 +124,60 @@ class TestFinalizeFlow(unittest.TestCase):
         app.current_run_dir = None
         app.last_finalize_result = None
 
-        app.handle_stop({"reason": "natural_end", "auto_report": True})
+        app.handle_stop({"reason": "natural_end", "auto_report": True, "notify": False})
 
+        vid.release.assert_called_once()
+
+    def test_finalize_detection_releases_video_only_once(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.stop_event = threading.Event()
+        app.running = True
+        app.detector = Mock()
+        app.detector.processing_end_time = None
+        app.detector.get_processing_summary_data.return_value = {"source_name": "demo", "total_violations": 0}
+        app._collect_finalize_artifacts = Mock(return_value=(None, None))
+        app.btn_upload = Mock()
+        app.btn_camera = Mock()
+        vid = Mock()
+        app.vid = vid
+        app.set_status = Mock()
+        app.demo_mode = False
+        app.current_run_dir = None
+        app.last_finalize_result = None
+
+        app.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
+        app.finalize_detection(auto_report=True, reason="manual_stop", notify=False)
+
+        vid.release.assert_called_once()
+        app._collect_finalize_artifacts.assert_called_once()
+
+    def test_handle_stop_after_finalize_does_not_export_again(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        app.finalize_completed = False
+        app.stop_event = threading.Event()
+        app.running = True
+        app.detector = Mock()
+        app.detector.processing_end_time = None
+        app.detector.get_processing_summary_data.return_value = {"source_name": "demo", "total_violations": 0}
+        app._collect_finalize_artifacts = Mock(return_value=(None, None))
+        app.btn_upload = Mock()
+        app.btn_camera = Mock()
+        vid = Mock()
+        app.vid = vid
+        app.set_status = Mock()
+        app.demo_mode = False
+        app.current_run_dir = None
+        app.last_finalize_result = None
+        worker = Mock()
+        app.worker = worker
+
+        app.handle_stop({"reason": "natural_end", "auto_report": True, "notify": False})
+        app.worker = worker
+        app.handle_stop({"reason": "natural_end", "auto_report": True, "notify": False})
+
+        self.assertIsNone(app.worker)
+        app._collect_finalize_artifacts.assert_called_once()
         vid.release.assert_called_once()
 
 
@@ -175,6 +243,48 @@ class TestRunOutputs(unittest.TestCase):
         self.assertNotEqual(first_run, second_run)
         self.assertTrue(os.path.exists(first_file))
         self.assertTrue(os.path.isdir(os.path.join(second_run, "screenshots")))
+
+    def test_event_logger_exports_reports_inside_current_run_folder(self):
+        app = main_gui.HelmetDetectionApp.__new__(main_gui.HelmetDetectionApp)
+        temp_root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(temp_root, ignore_errors=True))
+        app.output_root = temp_root
+        app.current_run_dir = None
+        app.current_screenshots_dir = None
+        app.current_reports_dir = None
+        app.current_violation_csv_path = None
+        app.current_heatmap_path = None
+        app.event_logger = EventLogger()
+        app.event_logger.add_event(
+            ViolationEvent(
+                timestamp="2026-05-15 10:00:00",
+                source="demo.mp4",
+                track_id="1",
+                person_count=1,
+                missing_items="helmet",
+                screenshot_path="",
+                confidence=0.9,
+                bbox="x=1,y=2,w=3,h=4",
+            )
+        )
+        app.stats = {"missing_counts": {"helmet": 1, "vest": 0, "goggles": 0, "mask": 0}}
+
+        csv_path = app._build_report_filepath("csv")
+        xlsx_path = app._build_report_filepath("xlsx")
+        pdf_path = app._build_report_filepath("pdf")
+
+        self.assertTrue(csv_path.startswith(app.current_reports_dir))
+        self.assertTrue(xlsx_path.startswith(app.current_reports_dir))
+        self.assertTrue(pdf_path.startswith(app.current_reports_dir))
+        self.assertTrue(os.path.isdir(app.current_screenshots_dir))
+
+        app._export_report_file("csv", csv_path, {})
+        app._export_report_file("xlsx", xlsx_path, {})
+        app._export_report_file("pdf", pdf_path, {})
+
+        self.assertTrue(os.path.exists(csv_path))
+        self.assertTrue(os.path.exists(xlsx_path))
+        self.assertTrue(os.path.exists(pdf_path))
 
 
 if __name__ == "__main__":

@@ -547,6 +547,7 @@ class HelmetDetectionApp:
             auto_report=stop_data.get("auto_report", True),
             reason=stop_data.get("reason", "natural_end"),
             error_message=stop_data.get("error", ""),
+            notify=stop_data.get("notify", True),
         )
 
     def _collect_finalize_artifacts(self, auto_report):

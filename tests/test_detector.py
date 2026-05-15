@@ -183,6 +183,23 @@ class TestDetectionBoundaries(unittest.TestCase):
         self.assertEqual(detector.update_temporal_state("track-1", ["helmet"]), [])
         self.assertEqual(detector.update_temporal_state("track-1", ["helmet"]), ["helmet"])
 
+    def test_temporal_state_immediate_when_configured_to_one_frame(self):
+        detector = create_detector(demo_mode=True)
+        detector.temporal_frames = 1
+
+        self.assertEqual(detector.update_temporal_state("track-1", ["vest", "helmet"]), ["helmet", "vest"])
+
+    def test_temporal_buffer_is_bounded_and_order_stable(self):
+        detector = create_detector(demo_mode=True)
+        detector.temporal_frames = 2
+
+        detector.update_temporal_state("track-1", ["vest", "helmet"])
+        detector.update_temporal_state("track-1", ["helmet", "vest"])
+        detector.update_temporal_state("track-1", ["mask"])
+
+        self.assertLessEqual(len(detector.person_buffers["track-1"]), 2)
+        self.assertEqual(detector.update_temporal_state("track-1", ["mask"]), ["mask"])
+
 
 class TestRealModeContracts(unittest.TestCase):
     def setUp(self):
@@ -257,6 +274,24 @@ class TestRealModeContracts(unittest.TestCase):
         self.assertEqual(info["missing_items"], ["helmet"])
         self.assertEqual(info["new_events"][0]["track_id"], "7")
 
+    def test_real_mode_temporal_smoothing_delays_event_until_stable(self):
+        detector = create_detector({0: "person", 1: "hardhat"})
+        detector.temporal_frames = 3
+        result = make_result(
+            {0: "person", 1: "hardhat"},
+            [(0, [100, 100, 220, 360], 0.95, 1)],
+        )
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, first_info = detector.detect(self.frame, ["helmet"], source_name="cam", frame_number=1)
+        _, second_info = detector.detect(self.frame, ["helmet"], source_name="cam", frame_number=2)
+        _, third_info = detector.detect(self.frame, ["helmet"], source_name="cam", frame_number=3)
+
+        self.assertFalse(first_info["violation_detected"])
+        self.assertFalse(second_info["violation_detected"])
+        self.assertTrue(third_info["violation_detected"])
+        self.assertEqual(third_info["missing_items"], ["helmet"])
+
     def test_mixed_mode_deduplicates_presence_and_direct_violation(self):
         detector = create_detector({0: "person", 1: "helmet", 2: "no_vest"})
         result = make_result(
@@ -275,6 +310,37 @@ class TestRealModeContracts(unittest.TestCase):
         self.assertEqual(len(info["new_events"]), 1)
         self.assertEqual(info["new_events"][0]["track_id"], "11")
         self.assertEqual(info["new_events"][0]["missing_list"], ["vest"])
+
+    def test_mixed_mode_direct_duplicate_does_not_repeat_event_item(self):
+        detector = create_detector({0: "person", 1: "no-hardhat"})
+        result = make_result(
+            {0: "person", 1: "no-hardhat"},
+            [
+                (0, [100, 100, 220, 360], 0.95, 21),
+                (1, [120, 110, 200, 180], 0.91, 21),
+                (1, [130, 120, 190, 170], 0.89, 21),
+            ],
+        )
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, ["helmet"], source_name="cam", frame_number=6)
+
+        self.assertTrue(info["violation_detected"])
+        self.assertEqual(len(info["new_events"]), 1)
+        self.assertEqual(info["new_events"][0]["missing_list"], ["helmet"])
+
+    def test_violation_alias_normalization_for_hyphenated_safety_vest(self):
+        detector = create_detector({0: "no-safety-vest"})
+        result = make_result(
+            {0: "no-safety-vest"},
+            [(0, [100, 100, 220, 360], 0.95, 8)],
+        )
+        detector.run_detection_with_tracking = Mock(return_value=([result], True))
+
+        _, info = detector.detect(self.frame, ["vest"], source_name="cam", frame_number=7)
+
+        self.assertTrue(info["violation_detected"])
+        self.assertEqual(info["missing_items"], ["vest"])
 
     def test_unsupported_detect_returns_clear_error(self):
         detector = create_detector({0: "person"})
